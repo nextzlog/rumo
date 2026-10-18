@@ -231,6 +231,7 @@ pub fn write_event(e: &Event, out: &mut String) {
             text,
             kind,
             verdict,
+            p,
         } => {
             o.int("track", *track as u64);
             o.int("sample", *sample);
@@ -239,6 +240,7 @@ pub fn write_event(e: &Event, out: &mut String) {
             o.str("kind", kind.name());
             o.bool("confirmed", verdict.confirmed());
             o.str("reason", verdict.name());
+            o.num("p", *p);
         }
         Event::TrackLost {
             track,
@@ -268,7 +270,7 @@ pub fn write_track(t: &TrackState, out: &mut String) {
     o.num("bias", t.bias);
     o.bool("keyOn", t.key_on);
     o.num("evidence", t.evidence);
-    o.key("pStation").push_str("null");
+    o.num("pStation", t.p_station);
     chars_json(o.key("held"), &t.held, false);
     guesses_json(o.key("guesses"), &t.guesses);
     o.end();
