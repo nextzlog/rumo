@@ -18,6 +18,7 @@
 //! an exact bound, so that the results equal those of a direct evaluation.
 
 use crate::model::*;
+use crate::syntax;
 use crate::Element;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -123,6 +124,8 @@ pub struct Common {
     pub res: [f64; 2],
     pub gaps: Vec<f64>,
     pub evs: Vec<Element>,
+    /// Per event of evs: whether a boundary lay under a louder station's keying edge.
+    pub unsure: Vec<bool>,
     pub lu: Vec<f64>,
     pub started: bool,
     pub ahead: Vec<char>,
@@ -147,6 +150,18 @@ pub struct Common {
     pub first_dropped: bool,
     /// Whether a clearly stronger confirmed station is near (set by the decoder).
     pub outshone: bool,
+    /// Whether a much stronger confirmed station is very near (set by the decoder): then
+    /// characters below the full commit threshold, or keyed under its edges, are held
+    /// back like doubtful ones.
+    pub guarded: bool,
+    /// Whether the next element has a boundary under a louder station's keying edge (set
+    /// by the decoder).
+    pub next_unsure: bool,
+    /// Whether the track's look-back reaches the start of the stream (set by the decoder).
+    pub at_start: bool,
+    /// A first character after a short silence at the stream start, held until its
+    /// token closes.
+    pub first_hold: Option<(char, CharMeta)>,
 }
 
 impl Common {
@@ -167,6 +182,7 @@ impl Common {
             res: [0.0; 2],
             gaps: Vec::new(),
             evs: Vec::new(),
+            unsure: Vec::new(),
             lu: Vec::new(),
             started: false,
             ahead: Vec::new(),
@@ -186,6 +202,10 @@ impl Common {
             first_done: false,
             first_dropped: false,
             outshone: false,
+            guarded: false,
+            next_unsure: false,
+            at_start: false,
+            first_hold: None,
         }
     }
 
@@ -251,8 +271,18 @@ impl Common {
     }
 
     pub fn emit_char(&mut self, c: char, space: bool) {
+        if self.first_hold.is_some() && space && self.nemit == 0 {
+            // the held character was a word of its own
+            self.decide_first();
+        }
         if !self.first_done {
             self.first_done = true;
+            if !self.lead_ok(c) && self.at_start && self.lead > 0.0 {
+                // a clean rise after silence at the stream start: the character is kept
+                // only if it turns the token that follows into a callsign
+                self.first_hold = Some((c, std::mem::take(&mut self.cur)));
+                return;
+            }
             if !self.lead_ok(c) {
                 // the first character may be the tail of one cut off by the track start
                 self.cur = CharMeta::default();
@@ -283,6 +313,9 @@ impl Common {
         if self.spaced || self.nemit == 0 {
             return;
         }
+        if self.first_hold.is_some() {
+            self.decide_first();
+        }
         self.spaced = true;
         self.held.push(' ');
         self.held_meta.push(CharMeta {
@@ -295,7 +328,36 @@ impl Common {
         }
     }
 
+    /// Decides a held first character: it is kept only if it makes a callsign of the
+    /// token that follows, which is none without it, and then marked doubtful, since the
+    /// syntax that decided it cannot also confirm the callsign.
+    pub fn decide_first(&mut self) {
+        let Some((c, mut meta)) = self.first_hold.take() else {
+            return;
+        };
+        let tok: String = self.held.iter().take_while(|&&x| x != ' ').collect();
+        let with = format!("{c}{tok}");
+        if !self.outshone
+            && !tok.is_empty()
+            && syntax::is_callsign(&with)
+            && !syntax::is_callsign(&tok)
+        {
+            meta.doubt = true;
+            self.held.insert(0, c);
+            self.held_meta.insert(0, meta);
+            self.nemit += 1;
+        } else {
+            self.first_dropped = true;
+        }
+        if self.confirmed_now {
+            self.release();
+        }
+    }
+
     pub fn release(&mut self) {
+        if self.first_hold.is_some() {
+            return;
+        }
         self.out.append(&mut self.held);
         self.out_meta.append(&mut self.held_meta);
     }
@@ -307,6 +369,23 @@ impl Common {
     }
 
     /// Updates b, r, gc, gw and the jitter scale from the events of committed character c.
+    /// Whether an element of character c, the next to be committed, or the space before
+    /// it lay under a louder station's keying edge.
+    pub fn unsure_char(&self, c: char) -> bool {
+        let skip = self.evs.iter().take_while(|e| !e.mark).count();
+        let n = (2 * code_of(c).len()).saturating_sub(1);
+        self.unsure.iter().take(skip + n).any(|&u| u)
+    }
+
+    /// Drops the events of character c without learning from them.
+    pub fn forget(&mut self, c: char) {
+        let skip = self.evs.iter().take_while(|e| !e.mark).count();
+        let n = (skip + (2 * code_of(c).len()).saturating_sub(1)).min(self.evs.len());
+        self.evs.drain(..n);
+        self.unsure.drain(..n);
+        self.lu.drain(..n);
+    }
+
     pub fn learn(&mut self, c: char) {
         let code = code_of(c).as_bytes();
         while !self.evs.is_empty() && !self.evs[0].mark {
@@ -316,10 +395,12 @@ impl Common {
                 self.gaps.remove(0);
             }
             self.evs.remove(0);
+            self.unsure.remove(0);
             self.lu.remove(0);
         }
         if code.is_empty() || self.evs.len() < 2 * code.len() - 1 {
             self.evs.clear();
+            self.unsure.clear();
             self.lu.clear();
             return;
         }
@@ -345,6 +426,7 @@ impl Common {
             self.st[li][1] = fl * self.st[li][1] + 1.0;
         }
         self.evs.drain(..n);
+        self.unsure.drain(..n);
         self.lu.drain(..n);
         self.scale = ((self.res[0] + SCALE_PRIOR_SUM) / (self.res[1] + SCALE_PRIOR_N) / SCALE_NORM)
             .clamp(SCALE_MIN, SCALE_MAX);
@@ -1226,6 +1308,8 @@ impl Timing {
         let p = self.marginal();
         self.c.posterior_stats(&p);
         self.c.evs.push(e);
+        self.c.unsure.push(self.c.next_unsure);
+        self.c.next_unsure = false;
         self.c.ev_base += 1;
         self.c.lu.push(self.c.best.u.ln());
         self.c.last_cens = 0.0;
@@ -1315,10 +1399,11 @@ impl Timing {
                     self.c.pend_since = self.c.ev_base;
                 }
                 let age = self.c.ev_base - self.c.pend_since;
-                if age < LAG_SOFT || (bm < TAU_SOFT && age < LAG_HARD) {
+                let soft = if self.c.guarded { TAU_COMMIT } else { TAU_SOFT };
+                if age < LAG_SOFT || (bm < soft && age < LAG_HARD) {
                     return;
                 }
-                if bm < TAU_SOFT {
+                if bm < soft {
                     let c = best;
                     self.c.pend_since = -1;
                     self.c.cur = CharMeta {
@@ -1346,7 +1431,14 @@ impl Timing {
                 doubt: false,
                 alts: top_alts(&mass, 3),
             };
-            self.c.emit_char(best, space);
+            let held_back = !censored && self.c.guarded && self.c.unsure_char(best);
+            if held_back {
+                // keyed under a much stronger neighbour's edges: held back like a doubtful
+                // character, and not learnt from
+                self.c.cur.doubt = true;
+            } else {
+                self.c.emit_char(best, space);
+            }
             if censored {
                 self.c.ahead.push(best);
                 let hh = own.take().unwrap();
@@ -1361,7 +1453,11 @@ impl Timing {
                 continue;
             }
             self.condition(best, if space { 1 } else { 0 });
-            self.c.learn(best);
+            if held_back {
+                self.c.forget(best);
+            } else {
+                self.c.learn(best);
+            }
         }
     }
 
@@ -1505,6 +1601,7 @@ impl Timing {
         self.set_h(nh);
         self.c.ahead.clear();
         self.c.evs.clear();
+        self.c.unsure.clear();
         self.c.lu.clear();
         self.c.pend_since = -1;
     }
@@ -1548,7 +1645,9 @@ impl Timing {
                 ),
             };
             let space = get_mass(&spm, best) > SPACE_FRAC * bm;
-            if p >= TAU_SOFT || !self.c.outshone {
+            let soft = if self.c.guarded { TAU_COMMIT } else { TAU_SOFT };
+            let held_back = self.c.guarded && self.c.unsure_char(best);
+            if (p >= soft || !self.c.outshone) && !held_back {
                 self.c.emit_char(best, space);
             }
             h = self.strip_first(&h, best);
@@ -1673,6 +1772,12 @@ impl Timing {
     pub fn learned_b(&self) -> f64 {
         self.c.b
     }
+    /// Ends the track: a held first character is decided and all text released.
+    pub fn finish(&mut self) {
+        self.c.decide_first();
+        self.c.release()
+    }
+
     pub fn release(&mut self) {
         self.c.release()
     }
@@ -1825,6 +1930,101 @@ mod tests {
         // a code that ends no other code cannot be a tail
         let (text, _) = run("--.- - . ... -", 0.8);
         assert_eq!(text.trim(), "QTEST");
+    }
+
+    /// Decodes words (separated by word gaps) after a leading silence of `lead` units, the
+    /// track's look-back reaching the stream start.
+    fn run_start(words: &[&str], lead: f64) -> (String, Vec<CharMeta>) {
+        let mut t = Timing::new();
+        t.c.at_start = true;
+        let u = 0.06;
+        t.add_element(Element {
+            mark: false,
+            d: lead * u,
+        });
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 {
+                t.add_element(Element {
+                    mark: false,
+                    d: 7.0 * u,
+                });
+            }
+            feed(&mut t, w, u);
+        }
+        let mut g = 0.0;
+        while g < 1.5 {
+            g += 0.005;
+            t.tick(g, true, false);
+        }
+        t.add_element(Element { mark: false, d: g });
+        t.finish();
+        t.take_out()
+    }
+
+    #[test]
+    fn first_character_at_stream_start_is_kept_if_it_completes_a_callsign() {
+        // O (the tail of J) after 0.4 units of silence: OO1ZQG/1 is a callsign and
+        // O1ZQG/1 is none
+        let call = "--- --- .---- --.. --.- --. -..-. .----";
+        let (text, meta) = run_start(&[call], 0.4);
+        assert_eq!(text.trim(), "OO1ZQG/1");
+        // the kept character is doubtful: the syntax that decided it cannot confirm it
+        assert!(meta[0].doubt && !meta[1].doubt);
+        // T (the tail of many codes) before JA1ZLO: TJA1ZLO is no callsign
+        let (text, _) = run_start(&["- .--- .- .---- --.. .-.. ---"], 0.4);
+        assert_eq!(text.trim(), "JA1ZLO");
+        // a first character that is a word of its own is dropped
+        let (text, _) = run_start(&["-", ".--- .- .---- --.. .-.. ---"], 0.4);
+        assert_eq!(text.trim(), "JA1ZLO");
+        // without the stream start the first character is dropped as before
+        let (text, _) = run(call, 0.4);
+        assert_eq!(text.trim(), "O1ZQG/1");
+    }
+
+    /// Decodes C Q T E S T on a guarded track, the elements of the character at index
+    /// `flag` lying under a stronger station's edges.
+    fn guarded_run(flag: usize) -> String {
+        let u = 0.06;
+        let mut t = Timing::new();
+        t.c.outshone = true;
+        t.c.guarded = true;
+        t.add_element(Element {
+            mark: false,
+            d: 10.0 * u,
+        });
+        for (n, ch) in "-.-. --.- - . ... -".split(' ').enumerate() {
+            if n > 0 {
+                t.add_element(Element {
+                    mark: false,
+                    d: 3.0 * u,
+                });
+            }
+            for (i, e) in ch.chars().enumerate() {
+                if i > 0 {
+                    t.c.next_unsure = n == flag;
+                    t.add_element(Element { mark: false, d: u });
+                }
+                t.c.next_unsure = n == flag;
+                t.add_element(Element {
+                    mark: true,
+                    d: if e == '.' { u } else { 3.0 * u },
+                });
+            }
+        }
+        let mut g = 0.0;
+        while g < 1.5 {
+            g += 0.005;
+            t.tick(g, true, false);
+        }
+        t.add_element(Element { mark: false, d: g });
+        t.take_out().0.trim().to_string()
+    }
+
+    #[test]
+    fn guarded_track_holds_characters_keyed_under_edges() {
+        let clean = guarded_run(usize::MAX);
+        assert!(clean.starts_with("CQT"), "{clean}");
+        assert_eq!(guarded_run(1), clean.replacen('Q', "", 1));
     }
 
     #[test]

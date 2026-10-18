@@ -408,3 +408,102 @@ fn tokens_of_a_clean_call_are_confirmed() {
         .iter()
         .any(|t| t.0 == "DE" && t.1 == TokenKind::Procedure));
 }
+
+/// Mean CER of a station 20 dB below a strong one at `df` Hz, its committed characters,
+/// and how many of them are wrong (over the seeds).
+fn weak_beside_strong(df: f64, seeds: std::ops::RangeInclusive<u64>) -> (f64, usize, usize) {
+    let (mut sum, mut n, mut chars, mut wrong) = (0.0, 0.0, 0, 0);
+    for seed in seeds {
+        let a = Station::new("CQ TEST DE JA1ZLO JA1ZLO K", 700.0, 27.0);
+        let mut w = Station::new("JH1ABC 5NN 1317M TU", 700.0 + df, 22.0);
+        w.seed = 40 + seed;
+        w.start = 0.9;
+        w.amp = 0.03; // 20 dB weaker
+        let secs = a.end().max(w.end()) + 3.0;
+        let x = scene(&[a.clone(), w.clone()], secs, 25.0, 40 + seed);
+        let t = texts(&decode(&x, 400, Config::default()));
+        let got: String = t
+            .iter()
+            .filter(|x| (x.1 - w.freq).abs() < 15.0)
+            .map(|x| x.2.clone())
+            .collect();
+        sum += cer(&got, &w.text);
+        n += 1.0;
+        let g: Vec<char> = got.chars().filter(|c| *c != ' ').collect();
+        chars += g.len();
+        wrong += g.len().saturating_sub(lcs(
+            &g,
+            &w.text.replace(' ', "").chars().collect::<Vec<_>>(),
+        ));
+    }
+    (sum / n, chars, wrong)
+}
+
+/// Length of the longest common subsequence.
+fn lcs(a: &[char], b: &[char]) -> usize {
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in 0..a.len() {
+        for j in 0..b.len() {
+            d[i + 1][j + 1] = if a[i] == b[j] {
+                d[i][j] + 1
+            } else {
+                d[i][j + 1].max(d[i + 1][j])
+            };
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+#[test]
+fn weak_station_80_hz_from_strong_one_is_read_through_its_edges() {
+    let (c, chars, wrong) = weak_beside_strong(80.0, 1..=4);
+    assert!(c <= 0.1, "mean CER {c}");
+    assert!(
+        wrong * 20 <= chars,
+        "{wrong} of {chars} committed characters wrong"
+    );
+}
+
+#[test]
+fn weak_station_25_hz_away_is_tracked_at_its_frequency() {
+    let mut hits = 0;
+    for seed in 1..=4 {
+        let a = Station::new("CQ TEST DE JA1ZLO JA1ZLO K", 700.0, 25.0);
+        let mut w = Station::new("JH1ABC 5NN 1317M TU", 725.0, 21.0);
+        w.seed = 50 + seed;
+        w.start = 0.9;
+        w.amp = 0.3 * 10f64.powf(-0.5); // 10 dB weaker
+        let secs = a.end().max(w.end()) + 3.0;
+        let x = scene(&[a.clone(), w.clone()], secs, 15.0, 50 + seed);
+        let born: Vec<f64> = decode(&x, 400, Config::default())
+            .iter()
+            .filter_map(|e| match e {
+                Event::TrackBorn { freq, .. } if (freq - 700.0).abs() > 12.0 => Some(*freq),
+                _ => None,
+            })
+            .collect();
+        if born.iter().any(|f| (f - 725.0).abs() < 8.0) {
+            hits += 1;
+        }
+    }
+    assert!(hits >= 3, "{hits} of 4 seeds");
+}
+
+#[test]
+fn first_character_after_a_clean_start_completes_a_callsign() {
+    // the recording starts 20 ms before the first mark; O alone could be the tail of J,
+    // but OO1ZQG/1 is a callsign and O1ZQG/1 is none
+    let mut st = Station::new("OO1ZQG/1", 700.0, 22.0);
+    st.start = 0.02;
+    let x = scene(std::slice::from_ref(&st), st.end() + 3.0, 25.0, 9);
+    let ev = decode_flush(&x, 400, Config::default());
+    let t = texts(&ev);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert_eq!(t[0].2.trim(), "OO1ZQG/1");
+    // the character decided by the syntax is doubtful, so the callsign is not confirmed
+    for e in &ev {
+        if let Event::Token { text, verdict, .. } = e {
+            assert!(!verdict.confirmed(), "{text}: {verdict:?}");
+        }
+    }
+}

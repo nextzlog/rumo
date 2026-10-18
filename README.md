@@ -53,26 +53,32 @@ Audio samples become events in 5 ms frames.
 ```mermaid
 flowchart TD
   A[Audio samples] --> B[Hann window 40 ms, FFT every 5 ms]
-  B --> C[Joint least-squares fit of all track lines with steady and ramp columns]
+  B --> C[Joint least-squares fit of all track lines with steady and ramp columns, quadrature ramp held near its slow average]
   C --> D[Residual spectrum]
   D --> E[Per-bin noise floor and local CFAR]
-  E --> F[Birth candidates with skirt masking]
-  F -->|persists 4 frames| G[New track with look-back replay of 0.8 s]
+  E --> F[Birth candidates: reset below the steady skirt, frozen below the skirt or edge leakage of louder tracks]
+  F -->|counted 4 frames| Q[Joint position of the new line beside nearby tracks]
+  Q --> G[New track with look-back replay of 0.8 s]
   C --> H[Track amplitude per frame]
   G --> H
+  C --> S[Keying-edge leakage of louder tracks]
   H --> I[Phase-advance frequency refinement]
   H --> J[Level keyer: noise and key-down levels]
-  H --> K[Key-state network]
+  H --> K[Key-state network, fed the last clean frame under strong leakage]
+  S --> K
   J --> R[Rician likelihood]
   K --> L[Blend over the first 200 frames of a track]
   R --> L
-  L --> M[Soft keyer: explicit-duration HSMM]
+  L --> T[Shrink towards zero by the leakage]
+  S --> T
+  T --> M[Soft keyer: explicit-duration HSMM]
   M -->|marks, spaces and open gap| N[Timing model: speed grid, Morse tree and character prior]
   N --> O[Commit rule]
   O --> P[Events]
 ```
 
 The key-state network turns seven features per track and frame into a key-down likelihood.
+Its neighbour inputs describe only a neighbour beyond the 150 Hz reach of keying-edge leakage, because a closer one made it follow the neighbour's keying; closer neighbours are handled by the joint fit, the edge leakage model and the common-fate checks.
 
 ```mermaid
 flowchart LR
@@ -80,7 +86,7 @@ flowchart LR
   B[Own log power over bin floor] --> F
   C[Own phase consistency] --> F
   D[Own log power below peak] --> F
-  E[Strongest neighbour within 300 Hz: power, offset, phase consistency] --> F
+  E[Strongest neighbour 150 to 300 Hz away: power, offset, phase consistency] --> F
   F --> G[GRU, 24 units]
   G --> H[Linear output over temperature]
   H --> I[Logit minus prior logit, times 0.75, clipped to 8]
@@ -94,8 +100,8 @@ stateDiagram-v2
   [*] --> Candidate: residual line persists
   Candidate --> Candidate: evidence below gate, text held
   Candidate --> Confirmed: evidence and two confident informative characters
-  Candidate --> Rejected: onsets follow a stronger neighbour
-  Candidate --> Lost: silent 2.5 s
+  Candidate --> Rejected: onsets follow a stronger neighbour's edges beyond chance, never keyed while it is silent
+  Candidate --> Lost: both keyers silent 2.5 s
   Confirmed --> Confirmed: commits
   Confirmed --> Lost: silent 6 s or merged
   Rejected --> Lost
@@ -144,9 +150,11 @@ flowchart TD
   A[Element or open gap] --> B{Morse evidence above gate}
   B -->|no| Z[Wait]
   B -->|yes| C{Posterior of next character at least 0.99}
-  C -->|yes| D[Commit]
-  C -->|no| E{At least 6 events and posterior at least 0.9}
-  E -->|yes| D
+  C -->|yes| V{Much stronger station within 70 Hz and the character's elements or the space before it under its keying edges}
+  V -->|no| D[Commit]
+  V -->|yes| O
+  C -->|no| E{At least 6 events, posterior at least 0.9, no much stronger station within 70 Hz}
+  E -->|yes| V
   E -->|no| F{At least 14 events}
   F -->|no| Z
   F -->|yes| N{Clearly stronger station within 300 Hz}
@@ -158,11 +166,23 @@ flowchart TD
   J -->|no| K[Emit]
   J -->|yes| L{Silence before it at least a character gap, or its code ends no other code}
   L -->|yes| K
-  L -->|no| M[Drop as a possible cut-off tail]
+  L -->|no| W{Look-back reaches the stream start and silence before it}
+  W -->|no| M[Drop as a possible cut-off tail]
+  W -->|yes| X{It makes a callsign of the following token, which is none without it}
+  X -->|yes| Y[Emit as doubtful]
+  X -->|no| M
 ```
 
 The Morse tree carries a character prior: at each node the next dit or dah, and continuing or ending the character, are weighted by tempered character frequencies, so that ambiguous gaps favour whole, likely characters.
 On a track that a confirmed station at least 6 dB stronger within 300 Hz outshines, the prior is switched off, because there it turns spurious elements into confident characters, and doubtful characters are held back.
+When that station is at least 10 dB stronger and within 70 Hz, a character is committed only at the full threshold of 0.99, and a character is held back and not learnt from when one of its element boundaries lies within two frames of the station's keying edges or when the space before it or within it holds such an edge, which may have erased a mark.
+At the start of the stream, a first character after a short silence may be the tail of a character that was cut off; it is kept, as doubtful, only if it makes a callsign of the token that follows, which is none without it.
+
+A keying edge of a strong station leaks into its neighbours, most strongly 40 to 60 Hz away (about 16 dB below its key-down level in the worst frame of a 40 ms window).
+The decoder estimates this leakage per frame from the share of the key-down amplitude in the window and its change from the previous frame, and uses it in three places: a birth candidate that the leakage could explain is frozen instead of counted, the key-down likelihood of a weaker track is shrunk by one plus the leakage over its key-down power, and the key-state network sees the last clean frame while the leakage exceeds a tenth of that power.
+The ramp column of each line is split into an in-phase part, which follows keying edges freely, and a quadrature part, which models a frequency error and is held near its slow average, so that the ramp no longer takes up a neighbour 25 to 50 Hz away whose beat rotates from frame to frame.
+A new line is placed where it best explains the last four spectra together with the lines and ramps of nearby tracks, because its residual peak is pushed away from a strong neighbour.
+A candidate whose onsets coincide with a stronger neighbour's edges is rejected as a ghost only if the coincidence clearly exceeds the chance rate given by the density of those edges, and never if it was key-down in at least ten frames, and a tenth of the frames, in which all its louder neighbours were silent.
 
 ## Tokens
 

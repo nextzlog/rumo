@@ -41,6 +41,18 @@ const MASK_FLAT_HZ: f64 = 30.0;
 const MASK_SLOPE_DB_HZ: f64 = 0.1;
 /// Largest skirt mask attenuation (dB).
 const MASK_MAX_DB: f64 = 45.0;
+/// Attenuation (dB) of the steady skirt of a track's current power within
+/// `EDGE_GATE_HZ`: a birth candidate below it starts again.
+const STEADY_ATT_DB: f64 = 40.0;
+/// Range (Hz) within which a candidate explained by a louder track's skirt or keying-edge
+/// leakage is frozen (neither counted nor reset) instead of reset.
+const EDGE_GATE_HZ: f64 = 150.0;
+/// Frames a frozen candidate keeps its count (about the passage of one edge).
+const FREEZE_FRAMES: i64 = 10;
+/// Spectra kept, half width (bins) and steps of the joint position search of a new line.
+const JOINT_FRAMES: usize = 4;
+const JOINT_SPAN: f64 = 2.0;
+const JOINT_STEPS: usize = 16;
 /// Floor of the birth threshold relative to the strongest residual (dynamic range).
 const BIRTH_RANGE: f64 = 1e-5;
 /// Decay per frame of the remembered strongest residual.
@@ -75,6 +87,8 @@ const REFINE_SNR: f64 = 10.0;
 const REFINE_GAIN: f64 = 0.03;
 /// Speed ambiguity at or below which the timing estimate is not trusted.
 const AMBIG_LOW: f64 = 3.0;
+/// Decision lag of the soft keyer in frames.
+const SOFT_LAG: i64 = 20;
 /// Smallest key-down SNR given to the soft keyer.
 const SOFT_SNR_MIN: f64 = 2.0;
 /// A confirmed station within this distance (Hz) and this many dB above a track
@@ -111,16 +125,48 @@ const NN_RANGE: f64 = 9.2;
 /// Up and down steps of the noise quantile tracker (about the 20th percentile).
 const NN_UP: f64 = 0.005;
 const NN_DOWN: f64 = 0.02;
+/// Range (Hz) of the neighbour features.
+const NN_NEIGHBOUR_HZ: f64 = 300.0;
 /// Bounds of the log-power features.
 const NN_LA: (f64, f64) = (-10.0, 15.0);
 const NN_LB: (f64, f64) = (-10.0, 20.0);
 const NN_LP: (f64, f64) = (-15.0, 0.0);
-/// Range (Hz) of the neighbour features.
-const NN_NEIGHBOUR_HZ: f64 = 300.0;
 /// Smallest power in a logarithm.
 const POWER_MIN: f64 = 1e-30;
 /// Regularisation of the joint fit relative to the mean diagonal of the Gram matrix.
 const FIT_REG: f64 = 1e-3;
+/// Ridge on the quadrature ramp relative to its diagonal and update rate of its slow
+/// average.
+const QUAD_RIDGE: f64 = 4.0;
+const QUAD_RATE: f64 = 0.02;
+/// Keying-edge leakage model: amplitude share below which a frame has no edge, knee of
+/// the low side, amplitude step per frame of a full edge, and noise multiple subtracted.
+const EDGE_U_MIN: f64 = 0.05;
+const EDGE_U_KNEE: f64 = 0.12;
+const EDGE_STEP: f64 = 0.1;
+const EDGE_NOISE: f64 = 2.0;
+/// Key-down level over the line noise above which an unconfirmed track with Morse
+/// evidence is a source of edge leakage.
+const SOURCE_SNR: f64 = 10.0;
+/// Edge leakage, relative to a track's key-down power, above which the key-state network
+/// is given the last clean frame instead.
+const HOLD_LEAK: f64 = 0.1;
+/// Edge leakage, relative to a track's key-down power, that makes nearby element
+/// boundaries unsure, and the distance (frames) of such a boundary.
+const UNSURE_LEAK: f64 = 0.3;
+const UNSURE_FRAMES: i64 = 2;
+/// Common fate: a louder neighbour is silent below this share of its key-down power;
+/// a track key-down in this many such frames, and this share of them, is keyed
+/// independently.
+const QUIET_FRAC: f64 = 0.01;
+const FATE_ON: u32 = 10;
+const FATE_SHARE: f64 = 0.1;
+/// A ghost misses at most this share of the onsets that chance coincidence would miss.
+const GHOST_MISS: f64 = 0.5;
+/// A confirmed station within this distance (Hz) and this many dB above a track guards
+/// it: characters below the full commit threshold, or keyed under its edges, are held.
+const GUARD_HZ: f64 = 70.0;
+const GUARD_DB: f64 = 10.0;
 
 /// Committed text of one track (internal event).
 #[derive(Clone, Debug)]
@@ -150,11 +196,29 @@ pub struct Track {
     pub level: f64,
     edges: VecDeque<Edge>,
     peak_e: f64,
+    /// Smoothed share of the worst-case keying-edge leakage (births).
+    edge_m: f64,
+    /// Line power smoothed like the residual SNR of births.
+    e_sm: f64,
+    /// Frames in which every clearly louder confirmed neighbour was silent, and those of
+    /// them in which this track was key-down (common fate).
+    quiet: u32,
+    quiet_on: u32,
+    /// Slow average of the quadrature ramp over the line (2 pi T times the frequency
+    /// error).
+    quad: f64,
+    /// Line power of the last frame without strong edge leakage.
+    e_held: f64,
+    /// Frames (bit j: j frames ago) dominated by a louder track's edge leakage.
+    leak_bits: u128,
+    /// Frame in which the soft keyer last decided a mark.
+    soft_mark: i64,
     pub sk: Option<SoftKeyer>,
     nst: NnState,
 }
 
-/// Snapshot of one track in one frame (neighbour features of the key-state network).
+/// Snapshot of one track in one frame (neighbour features of the key-state network and
+/// neighbour state of the edge leakage model).
 #[derive(Clone, Copy)]
 struct NbRec {
     id: u32,
@@ -162,6 +226,12 @@ struct NbRec {
     la: f64,
     pc: f64,
     level: f64,
+    /// Line power, share of the worst-case edge leakage in this frame.
+    e: f64,
+    edge: f64,
+    confirmed: bool,
+    /// Whether its keying edges are a leakage source.
+    source: bool,
 }
 
 /// Parameters shared by the per-track functions.
@@ -202,12 +272,15 @@ pub struct Core {
     logm: Vec<f64>,
     nfloor: i64,
     smooth: Vec<f64>,
-    cand: HashMap<i64, i64>,
+    /// Birth candidates per bin: frames counted and the frame last counted.
+    cand: HashMap<i64, (i64, i64)>,
     ring: VecDeque<(Vec<C64>, Vec<NbRec>)>,
     pub frame_no: i64,
     pub out: Vec<Out>,
     gmax: f64,
     spec: Vec<C64>,
+    /// The last spectra (joint position of new lines).
+    specs: VecDeque<Vec<C64>>,
     /// Keyer output (track, frame, element) when recording is enabled.
     pub elements: Option<Vec<(u32, i64, Element)>>,
 }
@@ -231,6 +304,7 @@ impl Core {
             out: Vec::new(),
             gmax: 0.0,
             spec: Vec::new(),
+            specs: VecDeque::new(),
             elements: None,
         }
     }
@@ -273,13 +347,14 @@ impl Core {
         };
         for t in &mut self.tracks {
             t.tim.tick(t.key.gap() + FLUSH_GAP, true, true);
-            t.tim.release();
+            t.tim.finish();
             let f = ctx.hz(t.nu);
             deliver(&mut self.out, t, f);
         }
     }
 
-    /// Joint least squares for all tracks; returns the residual.
+    /// Joint least squares for all tracks (line and ramp per track, the quadrature part
+    /// of the ramp held near its slow average); returns the residual.
     fn fit(&mut self, spec: &[C64]) -> Vec<C64> {
         let mut resid = spec.to_vec();
         let lo = self.fe.lo as f64;
@@ -331,10 +406,16 @@ impl Core {
             for a in 0..n {
                 g[a * n + a] += C64::new(reg, 0.0);
             }
-            let c = solve(&mut g, &mut h, n);
+            let quads: Vec<f64> = cl.iter().map(|t| t.quad).collect();
+            let c = solve_ramp(&g, &h, &quads);
             for (a, t) in cl.iter_mut().enumerate() {
                 t.prev_c = t.c;
                 t.c = c[2 * a];
+                let e = t.c.re * t.c.re + t.c.im * t.c.im;
+                if t.key.on && e > REFINE_SNR * t.key.noise {
+                    let q = (c[2 * a + 1] * t.c.conj()).im / e;
+                    t.quad += QUAD_RATE * (q - t.quad);
+                }
                 for q in 0..2 {
                     let col = &cols[(2 * a + q) * w..(2 * a + q + 1) * w];
                     for (kk, &cv) in col.iter().enumerate() {
@@ -393,6 +474,10 @@ impl Core {
                 &mut self.elements,
             );
         }
+        self.specs.push_back(spec.to_vec());
+        if self.specs.len() > JOINT_FRAMES {
+            self.specs.pop_front();
+        }
         self.ring.push_back((resid.clone(), nb));
         if self.ring.len() > self.cfg.lookback {
             self.ring.pop_front();
@@ -414,19 +499,41 @@ impl Core {
         let th = 10f64.powf(self.cfg.birth_db / 10.0);
         let k0 = self.fe.kernel.at(0.0).abs();
         let k0 = k0 * k0;
-        let mut mask = vec![0.0; nb];
+        // Within EDGE_GATE_HZ of a track, a candidate below the steady skirt of its current
+        // power starts again (`mask`), and one below its usual skirt or its keying-edge
+        // leakage is frozen (`emask`): those can be the track's own model error, while a
+        // weak neighbour shows itself in the frames where the track is silent.
+        let steady = 10f64.powf(-STEADY_ATT_DB / 10.0);
+        let mut mask = vec![0.0f64; nb];
+        let mut emask = vec![0.0f64; nb];
+        for i in 0..self.tracks.len() {
+            let nl = self.line_noise(self.tracks[i].nu);
+            let t = &mut self.tracks[i];
+            let e = t.c.re * t.c.re + t.c.im * t.c.im;
+            t.edge_m = SNR_KEEP * t.edge_m + SNR_NEW * edge_fraction(e, t.prev_c, t.level, nl);
+            t.e_sm = SNR_KEEP * t.e_sm + SNR_NEW * e;
+        }
         for t in &self.tracks {
             let pk = t.peak_e.max(t.c.re * t.c.re + t.c.im * t.c.im) * k0;
-            for (k, mk) in mask.iter_mut().enumerate() {
+            let cur = t.e_sm * k0;
+            let source = t.confirmed || t.level > SOURCE_SNR * self.line_noise(t.nu);
+            let lk = if source { t.level * k0 * t.edge_m } else { 0.0 };
+            for k in 0..nb {
                 let df = self.hz((k + self.fe.lo) as f64 - t.nu).abs();
                 let mut att = MASK_ATT_DB + MASK_SLOPE_DB_HZ * (df - MASK_FLAT_HZ).max(0.0);
                 if att > MASK_MAX_DB {
                     att = MASK_MAX_DB;
                 }
-                let m = pk * 10f64.powf(-att / 10.0);
-                if m > *mk {
-                    *mk = m;
-                }
+                let skirt = 10f64.powf(-att / 10.0);
+                let (m, me) = if df <= EDGE_GATE_HZ {
+                    let hard = cur * steady;
+                    (hard, hard.max(cur * skirt) + lk * edge_leak(df))
+                } else {
+                    let m = pk * 10f64.powf(-att.max(STEADY_ATT_DB) / 10.0);
+                    (m, m)
+                };
+                mask[k] = mask[k].max(m);
+                emask[k] = emask[k].max(me);
             }
         }
         let mut gmax = 0.0;
@@ -452,10 +559,14 @@ impl Core {
             buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             loc[k as usize] = buf[buf.len() / 2] / EXP_MEDIAN;
         }
+        let mut esnr = vec![0.0; nb];
         for k in 0..nb {
-            let mut eff = self.floor[k].max(mask[k].max(BIRTH_RANGE * gmax.max(self.gmax)));
-            eff = eff.max(loc[k]);
-            snr[k] = self.smooth[k] * self.floor[k] / eff;
+            let eff = self.floor[k]
+                .max(BIRTH_RANGE * gmax.max(self.gmax))
+                .max(loc[k]);
+            let v = self.smooth[k] * self.floor[k];
+            snr[k] = v / eff.max(mask[k]);
+            esnr[k] = v / eff.max(emask[k]);
         }
         if gmax > self.gmax {
             self.gmax = gmax;
@@ -480,12 +591,29 @@ impl Core {
                 }
             }
             seen.push(key);
-            let cnt = self.cand.entry(key).or_insert(0);
-            *cnt += 1;
-            if *cnt < self.cfg.birth_run {
+            let fno = self.frame_no;
+            let cnt = self.cand.entry(key).or_insert((0, fno));
+            if esnr[k] < th {
+                // frozen, but not for longer than the passage of an edge
+                if fno - cnt.1 > FREEZE_FRAMES {
+                    *cnt = (0, fno);
+                }
                 continue;
             }
-            let (l, c, r) = (snr[k - 1], snr[k], snr[k + 1]);
+            *cnt = (cnt.0 + 1, fno);
+            if cnt.0 < self.cfg.birth_run {
+                continue;
+            }
+            // position from the residual power: the masks fall with the distance from a
+            // strong track and would push the peak away from it
+            let pw = |j: usize| self.smooth[j] * self.floor[j];
+            let mut k = k;
+            for j in [k - 2, k - 1, k + 1, k + 2] {
+                if j >= 1 && j + 1 < nb && pw(j) > pw(k) {
+                    k = j;
+                }
+            }
+            let (l, c, r) = (pw(k - 1), pw(k), pw(k + 1));
             let mut nu = (k + self.fe.lo) as f64;
             let den = l - 2.0 * c + r;
             if den != 0.0 {
@@ -496,6 +624,10 @@ impl Core {
         rs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut born: Vec<f64> = Vec::new();
         for &(nu, _) in &rs {
+            if self.near(nu) {
+                continue;
+            }
+            let nu = self.joint_position(nu);
             let mut ok = !self.near(nu);
             for &b in &born {
                 if self.hz(b - nu).abs() < BIRTH_SPACING_HZ {
@@ -510,9 +642,94 @@ impl Core {
             self.cand.remove(&k);
             self.cand.remove(&(k - 1));
             self.cand.remove(&(k + 1));
+            // candidates counted beside the new line before it was fitted start again
+            let clear = self.fe.hz_bin(EDGE_GATE_HZ);
+            let lo = self.fe.lo as f64;
+            self.cand
+                .retain(|&c, _| ((c as f64 + lo) - nu).abs() > clear);
             self.spawn(nu, dt);
         }
         self.cand.retain(|k, _| seen.contains(k));
+    }
+
+    /// Noise power in a line coefficient at frequency nu (bins), from the residual floor.
+    fn line_noise(&self, nu: f64) -> f64 {
+        let k = (nu.round() as i64 - self.fe.lo as i64).clamp(0, self.floor.len() as i64 - 1);
+        self.floor[k as usize] / self.fe.kernel.norm
+    }
+
+    /// Position (bins) near nu of a new line that best explains the last spectra together
+    /// with the line and ramp of every track within reach: the residual peak of a weak
+    /// line beside a strong one is pushed away from the strong line.
+    fn joint_position(&self, nu: f64) -> f64 {
+        let k = &self.fe.kernel;
+        let lo = self.fe.lo as f64;
+        let near: Vec<f64> = self
+            .tracks
+            .iter()
+            .filter(|t| (t.nu - nu).abs() < 2.0 * k.r)
+            .map(|t| t.nu)
+            .collect();
+        if near.is_empty() || self.specs.is_empty() {
+            return nu;
+        }
+        let mut best = (f64::INFINITY, nu);
+        for j in 0..=JOINT_STEPS {
+            let x = nu + JOINT_SPAN * (2.0 * j as f64 / JOINT_STEPS as f64 - 1.0);
+            let mut lines: Vec<(f64, bool)> =
+                near.iter().flat_map(|&v| [(v, false), (v, true)]).collect();
+            lines.push((x, false));
+            let n = lines.len();
+            let a = near.iter().fold(x, |m, &v| m.min(v));
+            let b = near.iter().fold(x, |m, &v| m.max(v));
+            let b0 = (a - k.r - lo).floor().max(0.0) as usize;
+            let b1 = (b + k.r - lo).ceil().min((self.floor.len() - 1) as f64) as usize;
+            let w = b1 - b0 + 1;
+            let mut cols = vec![C64::ZERO; n * w];
+            for (i, &(v, ramp)) in lines.iter().enumerate() {
+                for q in 0..w {
+                    let d = (b0 + q) as f64 + lo - v;
+                    cols[i * w + q] = if ramp { k.ramp(d) } else { k.at(d) };
+                }
+            }
+            let mut g0 = vec![C64::ZERO; n * n];
+            let mut reg = 0.0;
+            for i in 0..n {
+                for jj in 0..n {
+                    let mut acc = C64::ZERO;
+                    for q in 0..w {
+                        acc += cols[i * w + q].conj() * cols[jj * w + q];
+                    }
+                    g0[i * n + jj] = acc;
+                }
+                reg += g0[i * n + i].re;
+            }
+            reg *= FIT_REG / n as f64;
+            for i in 0..n {
+                g0[i * n + i] += C64::new(reg, 0.0);
+            }
+            let mut cost = 0.0;
+            for sp in &self.specs {
+                let mut h = vec![C64::ZERO; n];
+                for (i, hi) in h.iter_mut().enumerate() {
+                    for q in 0..w {
+                        *hi += cols[i * w + q].conj() * sp[b0 + q];
+                    }
+                }
+                let c = solve(&mut g0.clone(), &mut h, n);
+                for q in 0..w {
+                    let mut r = sp[b0 + q];
+                    for (i, &ci) in c.iter().enumerate() {
+                        r -= ci * cols[i * w + q];
+                    }
+                    cost += r.re * r.re + r.im * r.im;
+                }
+            }
+            if cost < best.0 {
+                best = (cost, x);
+            }
+        }
+        best.1
     }
 
     fn near(&self, nu: f64) -> bool {
@@ -535,6 +752,14 @@ impl Core {
             level: 0.0,
             edges: VecDeque::new(),
             peak_e: 0.0,
+            edge_m: 0.0,
+            e_sm: 0.0,
+            quiet: 0,
+            quiet_on: 0,
+            quad: 0.0,
+            e_held: 0.0,
+            leak_bits: 0,
+            soft_mark: self.frame_no,
             sk: None,
             nst: NnState::default(),
         };
@@ -571,6 +796,7 @@ impl Core {
         }
         t.key.peak = t.key.peak.max(t.key.noise * PEAK_MIN_REL);
         let first = self.frame_no - cs.len() as i64 + 1;
+        t.tim.c.at_start = first <= 1;
         let ctx = Ctx {
             cfg: &self.cfg,
             rate: self.fe.rate as f64,
@@ -605,13 +831,15 @@ impl Core {
         for mut t in tracks {
             let silent = t.key.last_on as f64 * dt;
             let mut dead = silent > self.cfg.dead_sec;
-            if !t.confirmed && silent > CANDIDATE_DEAD_SEC {
+            // a candidate is silent when neither keyer has seen a mark
+            let soft_silent = (self.frame_no - t.soft_mark) as f64 * dt;
+            if !t.confirmed && silent > CANDIDATE_DEAD_SEC && soft_silent > CANDIDATE_DEAD_SEC {
                 dead = true;
             }
             if dead {
                 if t.confirmed {
                     t.tim.tick(t.key.gap(), true, true);
-                    t.tim.release();
+                    t.tim.finish();
                     let f = t.nu * rate / m;
                     deliver(&mut self.out, &mut t, f);
                 }
@@ -630,6 +858,95 @@ impl Core {
             }
         }
     }
+}
+
+/// Joint fit of a cluster with each ramp split into an in-phase part (an amplitude ramp,
+/// free) and a quadrature part (a frequency error, held near the track's slow average by
+/// a ridge): a frequency error is steady, while a close neighbour's beat rotates. The
+/// phase reference is this frame's line coefficient from the unconstrained fit. `g` and
+/// `h` are the complex normal equations over the columns line, ramp per track (already
+/// regularised) and `quads` the tracks' quadrature averages; returns the complex
+/// coefficients in the order of the columns.
+fn solve_ramp(g: &[C64], h: &[C64], quads: &[f64]) -> Vec<C64> {
+    let n = 2 * quads.len();
+    let r = 2 * n;
+    let cur = solve(&mut g.to_vec(), &mut h.to_vec(), n);
+    // real unknowns per track: line re, line im, ramp in-phase, ramp quadrature
+    let mut ph = vec![C64::ZERO; r];
+    for a in 0..quads.len() {
+        let m = cur[2 * a].abs();
+        let u = if m > 0.0 {
+            cur[2 * a] / C64::new(m, 0.0)
+        } else {
+            C64::new(1.0, 0.0)
+        };
+        ph[4 * a] = C64::new(1.0, 0.0);
+        ph[4 * a + 1] = C64::new(0.0, 1.0);
+        ph[4 * a + 2] = u;
+        ph[4 * a + 3] = u * C64::new(0.0, 1.0);
+    }
+    let base = |i: usize| 2 * (i / 4) + usize::from(i % 4 >= 2);
+    let mut gr = vec![0.0; r * r];
+    let mut hr = vec![0.0; r];
+    for i in 0..r {
+        for j in 0..r {
+            gr[i * r + j] = (ph[i].conj() * ph[j] * g[base(i) * n + base(j)]).re;
+        }
+        hr[i] = (ph[i].conj() * h[base(i)]).re;
+    }
+    for (a, &quad) in quads.iter().enumerate() {
+        let i = 4 * a + 3;
+        let lam = QUAD_RIDGE * gr[i * r + i];
+        gr[i * r + i] += lam;
+        hr[i] += lam * quad * cur[2 * a].abs();
+    }
+    let x = solve_real(&mut gr, &mut hr, r);
+    let mut c = vec![C64::ZERO; n];
+    for a in 0..quads.len() {
+        c[2 * a] = C64::new(x[4 * a], x[4 * a + 1]);
+        c[2 * a + 1] = ph[4 * a + 2] * C64::new(x[4 * a + 2], x[4 * a + 3]);
+    }
+    c
+}
+
+/// Gaussian elimination with partial pivoting for a small real system.
+fn solve_real(a: &mut [f64], b: &mut [f64], n: usize) -> Vec<f64> {
+    for col in 0..n {
+        let mut p = col;
+        for r in col + 1..n {
+            if a[r * n + col].abs() > a[p * n + col].abs() {
+                p = r;
+            }
+        }
+        if p != col {
+            for k in 0..n {
+                a.swap(col * n + k, p * n + k);
+            }
+            b.swap(col, p);
+        }
+        let piv = a[col * n + col];
+        if piv == 0.0 {
+            continue;
+        }
+        for r in col + 1..n {
+            let f = a[r * n + col] / piv;
+            for k in col..n {
+                a[r * n + k] -= f * a[col * n + k];
+            }
+            b[r] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for r in (0..n).rev() {
+        let mut s = b[r];
+        for k in r + 1..n {
+            s -= a[r * n + k] * x[k];
+        }
+        if a[r * n + r] != 0.0 {
+            x[r] = s / a[r * n + r];
+        }
+    }
+    x
 }
 
 /// Gaussian elimination with partial pivoting for a small complex system.
@@ -710,7 +1027,9 @@ fn advance(
 ) {
     let cfg = ctx.cfg;
     let e = c.re * c.re + c.im * c.im;
-    let feats = features(ctx, t, c, e, dt, nb);
+    let leak = edge_leak_in(ctx, t, nb);
+    let eh = held_power(t, e, leak);
+    let feats = features(ctx, t, c, eh, dt, nb);
     // phase-advance frequency refinement on strong frames
     if live
         && t.key.on
@@ -746,16 +1065,30 @@ fn advance(
         let w = t.nst.age as f64 / NN_BLEND as f64;
         llr = w * llr + (1.0 - w) * sk.rician_llr(x, s);
     }
+    // frames under a louder neighbour's keying edges carry little evidence either way
+    llr /= 1.0 + leak / t.level.max(t.key.noise);
     // a weak station next to a clearly stronger one holds doubtful characters back
     let lvl = t.level * 10f64.powf(OUTSHONE_DB / 10.0);
     t.tim.c.outshone = others_iter(others)
         .any(|o| o.confirmed && ctx.hz(o.nu - t.nu).abs() <= OUTSHONE_HZ && o.level > lvl);
+    let glvl = t.level * 10f64.powf(GUARD_DB / 10.0);
+    t.tim.c.guarded = others_iter(others)
+        .any(|o| o.confirmed && ctx.hz(o.nu - t.nu).abs() <= GUARD_HZ && o.level > glvl);
+    common_fate(ctx, t, nb, llr);
+    t.leak_bits = (t.leak_bits << 1) | u128::from(leak > UNSURE_LEAK * t.level.max(t.key.noise));
+    let bits = t.leak_bits;
+    let soft_mark = &mut t.soft_mark;
+    let sk = t.sk.as_mut().unwrap();
     let tim = &mut t.tim;
     let id = t.id;
     sk.step(llr, |el| {
         if let Some(log) = elements.as_mut() {
             log.push((id, fr, el));
         }
+        if el.mark {
+            *soft_mark = fr;
+        }
+        tim.c.next_unsure = boundary_unsure(bits, el, dt);
         tim.add_element(el)
     });
     if t.key.on != was {
@@ -800,10 +1133,15 @@ fn advance(
     }
 }
 
-/// Whether most of the track's onsets coincide with edges of a clearly stronger nearby track.
+/// Whether most of the track's onsets coincide with edges of a clearly stronger nearby
+/// track, clearly more often than the density of those edges explains by chance, and the
+/// track was never keyed on its own while its louder neighbours were silent.
 fn ghost_of(ctx: &Ctx, t: &Track, others: Others) -> bool {
     let ons: Vec<i64> = t.edges.iter().filter(|e| e.on).map(|e| e.fr).collect();
     if ons.len() < 3 {
+        return false;
+    }
+    if t.quiet_on >= FATE_ON && t.quiet_on as f64 >= FATE_SHARE * t.quiet as f64 {
         return false;
     }
     for o in others_iter(others) {
@@ -819,7 +1157,27 @@ fn ghost_of(ctx: &Ctx, t: &Track, others: Others) -> bool {
                 hit += 1;
             }
         }
-        if hit as f64 >= GHOST_FRAC * ons.len() as f64 {
+        if (hit as f64) < GHOST_FRAC * ons.len() as f64 {
+            continue;
+        }
+        // share of the frames spanned by the onsets that lie near an edge of the
+        // neighbour: random onsets hit that often by chance
+        let (a, b) = (ons[0] - GHOST_FRAMES, ons[ons.len() - 1] + GHOST_FRAMES);
+        let mut covered = 0;
+        let mut until = a;
+        for e in o.edges.iter() {
+            let (lo, hi) = (
+                (e.fr - GHOST_FRAMES).max(until),
+                (e.fr + GHOST_FRAMES + 1).min(b),
+            );
+            if hi > lo {
+                covered += hi - lo;
+                until = hi;
+            }
+        }
+        let p0 = covered as f64 / (b - a).max(1) as f64;
+        let miss = (ons.len() - hit) as f64;
+        if miss <= GHOST_MISS * (1.0 - p0) * ons.len() as f64 {
             return true;
         }
     }
@@ -830,6 +1188,115 @@ fn ghost_of(ctx: &Ctx, t: &Track, others: Others) -> bool {
 fn dominated(ctx: &Ctx, t: &Track, others: Others, e: f64) -> bool {
     others_iter(others)
         .any(|o| ctx.hz(o.nu - t.nu).abs() <= DOMINANCE_HZ && o.c.re * o.c.re + o.c.im * o.c.im > e)
+}
+
+/// Counts the frames in which every clearly louder confirmed neighbour is silent with no
+/// edge in the window, and those in which this track is key-down: a skirt or leakage
+/// ghost follows its neighbour's keying and is never key-down while the neighbour is
+/// silent.
+fn common_fate(ctx: &Ctx, t: &mut Track, nb: &[NbRec], llr: f64) {
+    let mut any = false;
+    for o in nb {
+        if o.id == t.id
+            || !o.confirmed
+            || o.level < GHOST_LEVEL * t.level
+            || ctx.hz(o.nu - t.nu).abs() > GHOST_HZ
+        {
+            continue;
+        }
+        any = true;
+        if o.edge > 0.0 || o.e > QUIET_FRAC * o.level {
+            return;
+        }
+    }
+    if any {
+        t.quiet += 1;
+        if llr > 0.0 {
+            t.quiet_on += 1;
+        }
+    }
+}
+
+/// Keying-edge leakage of louder tracks expected in the track's line in this frame (in
+/// units of its power).
+fn edge_leak_in(ctx: &Ctx, t: &Track, nb: &[NbRec]) -> f64 {
+    let mut leak = 0.0;
+    for o in nb {
+        if o.id == t.id || o.edge <= 0.0 || o.level <= t.level || !o.source {
+            continue;
+        }
+        leak += o.level * o.edge * edge_leak(ctx.hz(o.nu - t.nu).abs());
+    }
+    leak
+}
+
+/// Line power given to the key-state network: a frame dominated by a louder track's edge
+/// leakage repeats the last clean frame, so that the burst does not enter its memory.
+fn held_power(t: &mut Track, e: f64, leak: f64) -> f64 {
+    if leak > HOLD_LEAK * t.level.max(t.key.noise) && t.e_held > 0.0 {
+        return t.e_held;
+    }
+    t.e_held = e;
+    e
+}
+
+/// Whether an element just decided by the soft keyer (with its fixed lag) starts or ends
+/// within `UNSURE_FRAMES` of a frame dominated by a louder track's edge leakage, or is a
+/// space holding such a frame (which may hide a mark the leakage erased).
+fn boundary_unsure(bits: u128, el: Element, dt: f64) -> bool {
+    if bits == 0 {
+        return false;
+    }
+    let flagged = |j: i64| (0..128).contains(&j) && bits >> j & 1 == 1;
+    let run = (el.d / dt).round() as i64;
+    let near = [SOFT_LAG, SOFT_LAG + run]
+        .iter()
+        .any(|&b| (b - UNSURE_FRAMES..=b + UNSURE_FRAMES).any(flagged));
+    near || (!el.mark && (SOFT_LAG..SOFT_LAG + run).any(flagged))
+}
+
+/// Worst-case residual of a keying edge of a fitted line at offset df (Hz), relative to
+/// the line's peak bin power (40 ms Hann window, line and ramp subtracted; the larger of
+/// 5 ms raised-cosine and 0.3 ms edges).
+const EDGE_LEAK: [(f64, f64); 9] = [
+    (0.0, -20.0),
+    (25.0, -23.0),
+    (37.5, -16.5),
+    (50.0, -16.0),
+    (62.5, -16.0),
+    (80.0, -19.0),
+    (100.0, -21.5),
+    (125.0, -24.0),
+    (150.0, -25.0),
+];
+
+/// Worst-case edge leakage at offset df (Hz) as a power ratio (none beyond the table).
+fn edge_leak(df: f64) -> f64 {
+    if df > EDGE_LEAK[EDGE_LEAK.len() - 1].0 {
+        return 0.0;
+    }
+    let i = EDGE_LEAK.iter().position(|p| p.0 >= df).unwrap_or(1).max(1);
+    let (a, b) = (EDGE_LEAK[i - 1], EDGE_LEAK[i]);
+    let db = a.1 + (b.1 - a.1) * (df - a.0) / (b.0 - a.0);
+    10f64.powf(db / 10.0)
+}
+
+/// Share (0 to 1) of the worst-case edge leakage of a track in one frame: an edge inside
+/// the window leaves a partial share u of the key-down amplitude and moves the amplitude
+/// from frame to frame; noise-level frames, full key-down frames and slow fading leave
+/// none.
+fn edge_fraction(e: f64, prev: C64, level: f64, noise: f64) -> f64 {
+    if level <= 0.0 {
+        return 0.0;
+    }
+    let u2 = ((e - EDGE_NOISE * noise).max(0.0) / level).min(1.0);
+    let u = u2.sqrt();
+    if u < EDGE_U_MIN {
+        return 0.0;
+    }
+    let g = (u / EDGE_U_KNEE).powf(1.3).min(4.0 * (1.0 - u2)).min(1.0);
+    let step = (e.sqrt() - prev.abs()).abs() / level.sqrt();
+    g * (step / EDGE_STEP).min(1.0)
 }
 
 /// Cosine of the deviation of a frame's phase advance from the advance expected at the
@@ -853,17 +1320,24 @@ impl Core {
         self.tracks
             .iter()
             .map(|t| {
+                let e = t.c.re * t.c.re + t.c.im * t.c.im;
                 let mut la = t.nst.la;
                 if t.nst.init {
-                    let e = t.c.re * t.c.re + t.c.im * t.c.im;
                     la = clamp(e.max(POWER_MIN).ln() - t.nst.nf, NN_LA);
                 }
+                let evidence = t.sk.as_ref().map_or(0.0, |k| k.evidence(self.cfg.ev_win));
                 NbRec {
                     id: t.id,
                     nu: t.nu,
                     la,
                     pc: phase_cons(t.c, t.prev_c, self.hz(t.nu), dt),
                     level: t.level,
+                    e,
+                    edge: edge_fraction(e, t.prev_c, t.level, self.line_noise(t.nu)),
+                    confirmed: t.confirmed,
+                    source: t.confirmed
+                        || (t.level > SOURCE_SNR * self.line_noise(t.nu)
+                            && evidence >= self.cfg.ev_conf),
                 }
             })
             .collect()
@@ -899,13 +1373,16 @@ fn features(ctx: &Ctx, t: &mut Track, c: C64, e: f64, dt: f64, nb: &[NbRec]) -> 
     f[4] = 0.0;
     f[5] = 1.0;
     f[6] = 0.0;
+    // within the reach of keying-edge leakage the joint fit, the leakage model and the
+    // common-fate checks deal with neighbours: there the network's neighbour inputs made
+    // it follow a strong neighbour's keying
     let mut best = -1.0;
     for o in nb {
         if o.id == t.id {
             continue;
         }
         let df = ctx.hz(o.nu - t.nu).abs();
-        if df > NN_NEIGHBOUR_HZ || o.level <= best {
+        if df > NN_NEIGHBOUR_HZ || df <= EDGE_GATE_HZ || o.level <= best {
             continue;
         }
         best = o.level;
@@ -914,4 +1391,102 @@ fn features(ctx: &Ctx, t: &mut Track, c: C64, e: f64, dt: f64, nb: &[NbRec]) -> 
         f[6] = o.pc as f32;
     }
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_leakage_table() {
+        // strongest just outside the main lobe, falling beyond, none past 150 Hz
+        assert!(edge_leak(50.0) > edge_leak(25.0));
+        assert!(edge_leak(50.0) > edge_leak(100.0));
+        assert!(edge_leak(100.0) > edge_leak(150.0));
+        assert!((10.0 * edge_leak(50.0).log10() + 16.0).abs() < 1e-9);
+        assert_eq!(edge_leak(151.0), 0.0);
+    }
+
+    #[test]
+    fn edge_share_needs_a_partial_and_moving_amplitude() {
+        let level = 100.0;
+        let noise = 0.01;
+        let amp = |a: f64| C64::new(a, 0.0);
+        // steady key-down, silence and slow fading show no edge
+        assert_eq!(edge_fraction(level, amp(10.0), level, noise), 0.0);
+        assert_eq!(edge_fraction(0.02, amp(0.1), level, noise), 0.0);
+        assert!(edge_fraction(50.0, amp(7.0), level, noise) < 0.1);
+        // half the amplitude, moving by a third of the key-down amplitude per frame
+        assert_eq!(edge_fraction(25.0, amp(8.3), level, noise), 1.0);
+    }
+
+    #[test]
+    fn element_boundaries_under_edges_are_unsure() {
+        let el = Element {
+            mark: true,
+            d: 0.05,
+        };
+        let dt = 0.005;
+        assert!(!boundary_unsure(0, el, dt));
+        // the element ended SOFT_LAG frames ago and started 10 frames before that
+        assert!(boundary_unsure(1 << SOFT_LAG, el, dt));
+        assert!(boundary_unsure(1 << (SOFT_LAG + 10 + 2), el, dt));
+        assert!(!boundary_unsure(1 << (SOFT_LAG + 5), el, dt));
+        // a space with such a frame inside
+        let gap = Element {
+            mark: false,
+            d: 0.05,
+        };
+        assert!(boundary_unsure(1 << (SOFT_LAG + 5), gap, dt));
+    }
+
+    /// Residual power of a weak tone df Hz above a strong line after fitting the strong
+    /// line's columns alone, unconstrained and with the quadrature ridge.
+    fn absorbed(df: f64, ridge: bool) -> f64 {
+        let fe = Frontend::new(8000, 0.040, 250.0, 1300.0);
+        let k = &fe.kernel;
+        let nu = fe.hz_bin(700.0);
+        let nw = fe.hz_bin(700.0 + df);
+        let (b0, b1) = ((nu - k.r).floor() as usize, (nu + k.r).ceil() as usize);
+        let cols: Vec<[C64; 2]> = (b0..=b1)
+            .map(|b| [k.at(b as f64 - nu), k.ramp(b as f64 - nu)])
+            .collect();
+        let spec: Vec<C64> = (b0..=b1)
+            .map(|b| k.at(b as f64 - nw) * C64::cis(0.7))
+            .collect();
+        let mut g = vec![C64::ZERO; 4];
+        let mut h = vec![C64::ZERO; 2];
+        for (c, &y) in cols.iter().zip(&spec) {
+            for a in 0..2 {
+                for b in 0..2 {
+                    g[a * 2 + b] += c[a].conj() * c[b];
+                }
+                h[a] += c[a].conj() * y;
+            }
+        }
+        let reg = FIT_REG * (g[0].re + g[3].re) / 2.0;
+        g[0] += C64::new(reg, 0.0);
+        g[3] += C64::new(reg, 0.0);
+        let x = if ridge {
+            solve_ramp(&g, &h, &[0.0])
+        } else {
+            solve(&mut g.clone(), &mut h.clone(), 2)
+        };
+        let mut left = 0.0;
+        let mut all = 0.0;
+        for (c, &y) in cols.iter().zip(&spec) {
+            let r = y - x[0] * c[0] - x[1] * c[1];
+            left += r.re * r.re + r.im * r.im;
+            all += y.re * y.re + y.im * y.im;
+        }
+        left / all
+    }
+
+    #[test]
+    fn quadrature_ridge_leaves_a_close_neighbour_in_the_residual() {
+        // a free complex ramp takes up most of a tone 25 Hz away (frequency shift)
+        assert!(absorbed(25.0, false) < 0.25, "{}", absorbed(25.0, false));
+        assert!(absorbed(25.0, true) > 0.3, "{}", absorbed(25.0, true));
+        assert!(absorbed(50.0, true) > absorbed(50.0, false));
+    }
 }
