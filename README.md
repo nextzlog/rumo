@@ -40,6 +40,7 @@ $ cargo test
 | TrackConfirmed | freq | The candidate is a station. |
 | Commit | freq, text, chars | Confirmed characters, never revised. |
 | Tentative | held, text, pattern, guess, p, alts | Uncommitted state of a track. |
+| Token | start, text, kind, verdict | A closed token of committed text with its syntax verdict. |
 | Correction | retract, text | Reserved. |
 | TrackLost | candidate | The track ended. |
 
@@ -162,6 +163,36 @@ flowchart TD
 
 The Morse tree carries a character prior: at each node the next dit or dah, and continuing or ending the character, are weighted by tempered character frequencies, so that ambiguous gaps favour whole, likely characters.
 On a track that a confirmed station at least 6 dB stronger within 300 Hz outshines, the prior is switched off, because there it turns spurious elements into confident characters, and doubtful characters are held back.
+
+## Tokens
+
+Committed characters are never changed, but each closed token gets a verdict that tells whether it can be shown as confirmed.
+
+```mermaid
+flowchart TD
+  A[Committed characters of a track] --> B[Cut at spaces and at the end of the track]
+  B --> C{Whole token valid}
+  C -->|no| D[Split off glued DE, TU, R, UR, CQ, TEST and 5NN if every part becomes valid]
+  C -->|yes| E[Classify]
+  D --> E
+  E --> F{Callsign, exchange or procedure word}
+  F -->|no| U[Doubtful: unknown or invalid]
+  F -->|yes| G{First token after a dropped first character}
+  G -->|yes| T[Doubtful: truncated]
+  G -->|no| H{Callsign run together with a procedure word or a second callsign}
+  H -->|yes| R[Doubtful: run together]
+  H -->|no| I{Any doubtful character}
+  I -->|no| K[Confirmed]
+  I -->|yes| J{Same callsign read before on the track}
+  J -->|yes| L[Confirmed: repeated]
+  J -->|no| M[Doubtful: doubtful character]
+```
+
+A callsign has a prefix of one letter of the B F G I K M N R W series or two characters, one area digit and a suffix of one to four letters.
+Japanese prefixes JA to JS take a suffix of two or three letters, 7K to 7N take area 1 to 4 and three letters, and JD takes area 1.
+A prefix before a slash and a portable digit, P, M, MM, AM, A, QRP or country prefix after it are accepted.
+An exchange is a report such as 5NN or 599, or a number with cut digits and at least one real digit, ended by at most one power letter P, L, M or H.
+No callsign database is used.
 
 ## License
 

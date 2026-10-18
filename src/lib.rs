@@ -16,9 +16,11 @@ mod model;
 mod nn;
 mod nn_weights;
 mod special;
+mod syntax;
 mod timing;
 
 pub use model::{Alt, Guess};
+pub use syntax::{TokenKind, Verdict};
 
 use decoder::Core;
 use std::collections::BTreeMap;
@@ -144,6 +146,16 @@ pub enum Event {
         retract: u32,
         text: String,
     },
+    /// A token of a track's committed text closed by a space or by the end of the track,
+    /// with its class and verdict; `start` indexes the track's committed text.
+    Token {
+        track: u32,
+        sample: u64,
+        start: u32,
+        text: String,
+        kind: TokenKind,
+        verdict: Verdict,
+    },
     /// The track ended; `candidate` true means a rejected candidate.
     TrackLost {
         track: u32,
@@ -179,6 +191,7 @@ pub struct TrackState {
 struct Known {
     confirmed: bool,
     tent: String,
+    reader: syntax::Reader,
 }
 
 /// The streaming decoder.
@@ -242,7 +255,9 @@ impl Decoder {
             self.commit(o, self.sample);
         }
         let tracks = std::mem::take(&mut self.tracks);
-        for (id, k) in tracks {
+        for (id, mut k) in tracks {
+            let toks = k.reader.finish();
+            self.push_tokens(id, self.sample, toks);
             self.ev.push(Event::TrackLost {
                 track: id,
                 sample: self.sample,
@@ -267,6 +282,7 @@ impl Decoder {
                 v.insert(Known {
                     confirmed: t.confirmed,
                     tent: String::new(),
+                    reader: syntax::Reader::default(),
                 });
                 self.ev.push(Event::TrackBorn {
                     track: t.id,
@@ -332,7 +348,9 @@ impl Decoder {
             .filter(|id| !live.contains(id))
             .collect();
         for id in lost {
-            let k = self.tracks.remove(&id).unwrap();
+            let mut k = self.tracks.remove(&id).unwrap();
+            let toks = k.reader.finish();
+            self.push_tokens(id, end, toks);
             self.ev.push(Event::TrackLost {
                 track: id,
                 sample: end,
@@ -360,7 +378,21 @@ impl Decoder {
                     alts: Vec::new(),
                 },
             })
-            .collect();
+            .collect::<Vec<Char>>();
+        let dropped = self
+            .core
+            .tracks
+            .iter()
+            .any(|t| t.id == o.track && t.tim.c.first_dropped);
+        let toks = match self.tracks.get_mut(&o.track) {
+            Some(k) => {
+                if dropped {
+                    k.reader.truncate_first();
+                }
+                k.reader.feed(chars.iter().map(|c| (c.ch, c.doubtful)))
+            }
+            None => Vec::new(),
+        };
         self.ev.push(Event::Commit {
             track: o.track,
             sample,
@@ -368,6 +400,20 @@ impl Decoder {
             text: o.text,
             chars,
         });
+        self.push_tokens(o.track, sample, toks);
+    }
+
+    fn push_tokens(&mut self, track: u32, sample: u64, toks: Vec<syntax::Token>) {
+        for t in toks {
+            self.ev.push(Event::Token {
+                track,
+                sample,
+                start: t.start as u32,
+                text: t.text,
+                kind: t.kind,
+                verdict: t.verdict,
+            });
+        }
     }
 
     /// Live tracks sorted by frequency.
