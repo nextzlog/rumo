@@ -148,7 +148,9 @@ flowchart TD
   E -->|yes| D
   E -->|no| F{At least 14 events}
   F -->|no| Z
-  F -->|yes| G[Commit best guess as doubtful]
+  F -->|yes| N{Clearly stronger station within 300 Hz}
+  N -->|no| G[Commit best guess as doubtful]
+  N -->|yes| O[Hold the character back]
   H[Silence beyond 1.5 word gaps] --> I[Commit pending characters one by one while posterior at least 0.8]
   D --> J{First character of the track}
   G --> J
@@ -159,6 +161,7 @@ flowchart TD
 ```
 
 The Morse tree carries a character prior: at each node the next dit or dah, and continuing or ending the character, are weighted by tempered character frequencies, so that ambiguous gaps favour whole, likely characters.
+On a track that a confirmed station at least 6 dB stronger within 300 Hz outshines, the prior is switched off, because there it turns spurious elements into confident characters, and doubtful characters are held back.
 
 ## License
 

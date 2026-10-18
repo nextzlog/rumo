@@ -77,6 +77,10 @@ const REFINE_GAIN: f64 = 0.03;
 const AMBIG_LOW: f64 = 3.0;
 /// Smallest key-down SNR given to the soft keyer.
 const SOFT_SNR_MIN: f64 = 2.0;
+/// A confirmed station within this distance (Hz) and this many dB above a track
+/// outshines it.
+const OUTSHONE_HZ: f64 = 300.0;
+const OUTSHONE_DB: f64 = 6.0;
 /// Number of keying edges remembered per track.
 const EDGE_MEMORY: usize = 64;
 /// Weight of the previous value in the smoothed key-down power.
@@ -742,6 +746,10 @@ fn advance(
         let w = t.nst.age as f64 / NN_BLEND as f64;
         llr = w * llr + (1.0 - w) * sk.rician_llr(x, s);
     }
+    // a weak station next to a clearly stronger one holds doubtful characters back
+    let lvl = t.level * 10f64.powf(OUTSHONE_DB / 10.0);
+    t.tim.c.outshone = others_iter(others)
+        .any(|o| o.confirmed && ctx.hz(o.nu - t.nu).abs() <= OUTSHONE_HZ && o.level > lvl);
     let tim = &mut t.tim;
     let id = t.id;
     sk.step(llr, |el| {
