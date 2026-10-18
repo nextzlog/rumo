@@ -84,6 +84,11 @@ pub struct Token {
     pub text: String,
     pub kind: TokenKind,
     pub verdict: Verdict,
+    /// Lowest and summed log probability of its characters.
+    pub min_lp: f64,
+    pub sum_lp: f64,
+    /// Whether the same callsign was read before on the track.
+    pub repeat: bool,
 }
 
 /// Procedure words and common abbreviations accepted as they are.
@@ -338,14 +343,18 @@ fn run_together(w: &str, valid_call: bool) -> bool {
         .any(|i| w.is_char_boundary(i) && is_callsign(&w[..i]) && is_callsign(&w[i..]))
 }
 
+fn kind_is_seen(seen: &[String], text: &str) -> bool {
+    seen.iter().any(|s| s == text)
+}
+
 /// Calls remembered per track for the repetition rule.
 const SEEN_MAX: usize = 32;
 
 /// Token state of one track.
 #[derive(Default)]
 pub struct Reader {
-    /// Characters of the open token and their doubt flags.
-    open: Vec<(char, bool)>,
+    /// Characters of the open token, their doubt flags and probabilities.
+    open: Vec<(char, bool, f64)>,
     /// Index of the open token's first character.
     open_start: usize,
     /// Number of characters committed so far (spaces included).
@@ -358,16 +367,23 @@ pub struct Reader {
 
 impl Reader {
     /// Adds committed characters; returns the tokens closed by them.
+    #[cfg(test)]
     pub fn feed(&mut self, chars: impl Iterator<Item = (char, bool)>) -> Vec<Token> {
+        self.feed_p(chars.map(|(c, d)| (c, d, 1.0)))
+    }
+
+    /// Adds committed characters with their probabilities; returns the tokens closed by
+    /// them.
+    pub fn feed_p(&mut self, chars: impl Iterator<Item = (char, bool, f64)>) -> Vec<Token> {
         let mut out = Vec::new();
-        for (c, doubt) in chars {
+        for (c, doubt, p) in chars {
             if c == ' ' {
                 self.close(&mut out);
             } else {
                 if self.open.is_empty() {
                     self.open_start = self.pos;
                 }
-                self.open.push((c, doubt));
+                self.open.push((c, doubt, p));
             }
             self.pos += 1;
         }
@@ -402,12 +418,19 @@ impl Reader {
                 text: word,
                 kind: TokenKind::Unknown,
                 verdict: Verdict::Unknown,
+                min_lp: f64::NEG_INFINITY,
+                sum_lp: f64::NEG_INFINITY,
+                repeat: false,
             });
             return;
         }
         for (o, l) in split(&word) {
             let text = &word[o..o + l];
             let doubt = open[o..o + l].iter().any(|x| x.1);
+            let lps = open[o..o + l].iter().map(|x| x.2.max(1e-6).ln());
+            let min_lp = lps.clone().fold(0.0, f64::min);
+            let sum_lp = lps.sum::<f64>();
+            let repeat = kind_is_seen(&self.seen, text);
             let (kind, valid) = classify(text);
             let rt = kind == TokenKind::Callsign && run_together(text, valid);
             let verdict = if truncated && o == 0 && kind != TokenKind::Procedure {
@@ -451,6 +474,9 @@ impl Reader {
                 text: text.to_string(),
                 kind,
                 verdict,
+                min_lp,
+                sum_lp,
+                repeat,
             });
         }
     }

@@ -40,11 +40,12 @@ $ cargo test
 | TrackConfirmed | freq | The candidate is a station. |
 | Commit | freq, text, chars | Confirmed characters, never revised. |
 | Tentative | held, text, pattern, guess, p, alts | Uncommitted state of a track. |
-| Token | start, text, kind, verdict | A closed token of committed text with its syntax verdict. |
+| Token | start, text, kind, verdict, p | A closed token of committed text with its syntax verdict. |
 | Correction | retract, text | Reserved. |
 | TrackLost | candidate | The track ended. |
 
 Every event carries the track number and the sample index of its decision.
+Probabilities are calibrated (see Probabilities): a committed character of probability 0.95 is right about 95 times in 100.
 
 ## Algorithm
 
@@ -213,6 +214,32 @@ Japanese prefixes JA to JS take a suffix of two or three letters, 7K to 7N take 
 A prefix before a slash and a portable digit, P, M, MM, AM, A, QRP or country prefix after it are accepted.
 An exchange is a report such as 5NN or 599, or a number with cut digits and at least one real digit, ended by at most one power letter P, L, M or H.
 No callsign database is used.
+
+## Probabilities
+
+The posterior of the timing model is overconfident, so every reported probability passes a small logistic map fitted offline on synthetic signals.
+The maps change no character, commit or timing.
+
+```mermaid
+flowchart TD
+  A[Committed character] --> B[Posterior, forced guess, how and when committed, top two margin]
+  C[Track state] --> D[SNR, fade depth, timing jitter, Morse evidence, neighbours, unsure edges, characters so far]
+  B --> E[Character map]
+  D --> E
+  E --> F[Calibrated character probability]
+  F --> G[Alternatives rescaled]
+  H[Uncommitted best guess with the track state] --> E
+  I[Keying evidence, SNR, Morse evidence, characters, age, neighbours] --> J[Station map]
+  J --> K[Station probability of a track]
+  F --> L[Lowest and summed log probability of a callsign]
+  M[Valid syntax, earlier matching read] --> N[Callsign map]
+  L --> N
+  K --> N
+  N --> O[Callsign probability on the Token event]
+```
+
+Other tokens carry the product of their character probabilities.
+The station probability is reported with each track state.
 
 ## License
 

@@ -313,6 +313,8 @@ pub struct CharMeta {
     pub doubt: bool,
     /// Up to three alternatives including the chosen character.
     pub alts: Vec<Alt>,
+    /// Features of the calibrator, set when the character is emitted.
+    pub feat: [f32; crate::calib::NF],
 }
 
 /// One hypothesis group of the uncommitted text of a track.
@@ -324,7 +326,7 @@ pub struct Guess {
     pub pattern: String,
     /// The open character if it ended now ("" if the pattern is not a valid code).
     pub ch: String,
-    /// Posterior mass of this group.
+    /// Probability of this group (calibrated in events and track states).
     pub p: f64,
 }
 

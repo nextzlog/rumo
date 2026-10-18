@@ -150,6 +150,15 @@ pub struct Common {
     pub first_dropped: bool,
     /// Whether a clearly stronger confirmed station is near (set by the decoder).
     pub outshone: bool,
+    /// Key-down SNR of the track (dB, set by the decoder), how the character being
+    /// emitted was committed (0 at a space, 1 during an open gap, 2 at the end of a
+    /// transmission) and how many events it waited.
+    pub snr_db: f64,
+    /// Smoothed key-down power of the track against its recent peak (dB, set by the
+    /// decoder; low in a fade).
+    pub fade_db: f64,
+    pub path: u8,
+    pub age: i64,
     /// Whether a much stronger confirmed station is very near (set by the decoder): then
     /// characters below the full commit threshold, or keyed under its edges, are held
     /// back like doubtful ones.
@@ -202,6 +211,10 @@ impl Common {
             first_done: false,
             first_dropped: false,
             outshone: false,
+            snr_db: 0.0,
+            fade_db: 0.0,
+            path: 0,
+            age: 0,
             guarded: false,
             next_unsure: false,
             at_start: false,
@@ -270,7 +283,58 @@ impl Common {
         self.llr = LLR_FORGET * self.llr + l;
     }
 
+    /// Calibrator features of an uncommitted guess of probability p (no commit path).
+    pub fn guess_features(&self, p: f64) -> [f32; crate::calib::NF] {
+        let margin = ((p + 1e-3) / (1.0 - p + 1e-3)).ln().clamp(-5.0, 10.0);
+        let f = [
+            crate::calib::logit(p),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            margin / 10.0,
+            self.snr_db / 20.0,
+            self.scale,
+            (self.llr / 20.0).clamp(-2.0, 2.0),
+            self.outshone as u8 as f64,
+            self.guarded as u8 as f64,
+            0.0,
+            0.5,
+            (1.0 + self.nemit as f64).ln() / 4.0,
+            0.0,
+            self.fade_db / 10.0,
+        ];
+        f.map(|x| x as f32)
+    }
+
+    /// Calibrator features of character c from the current metadata and track state.
+    fn char_features(&self, c: char) -> [f32; crate::calib::NF] {
+        let m = &self.cur;
+        let second = m.alts.get(1).map(|a| a.p).unwrap_or(0.0);
+        let margin = ((m.conf + 1e-3) / (second + 1e-3)).ln().clamp(-5.0, 10.0);
+        let f = [
+            crate::calib::logit(m.conf),
+            m.doubt as u8 as f64,
+            (self.path == 1) as u8 as f64,
+            (self.path == 2) as u8 as f64,
+            self.age as f64 / LAG_HARD as f64,
+            margin / 10.0,
+            self.snr_db / 20.0,
+            self.scale,
+            (self.llr / 20.0).clamp(-2.0, 2.0),
+            self.outshone as u8 as f64,
+            self.guarded as u8 as f64,
+            self.unsure_char(c) as u8 as f64,
+            code_of(c).len() as f64 / 6.0,
+            (1.0 + self.nemit as f64).ln() / 4.0,
+            (self.at_start && self.nemit == 0) as u8 as f64,
+            self.fade_db / 10.0,
+        ];
+        f.map(|x| x as f32)
+    }
+
     pub fn emit_char(&mut self, c: char, space: bool) {
+        self.cur.feat = self.char_features(c);
         if self.first_hold.is_some() && space && self.nemit == 0 {
             // the held character was a word of its own
             self.decide_first();
@@ -322,6 +386,7 @@ impl Common {
             conf: 1.0,
             doubt: false,
             alts: Vec::new(),
+            ..CharMeta::default()
         });
         if confirmed {
             self.release();
@@ -1405,11 +1470,14 @@ impl Timing {
                 }
                 if bm < soft {
                     let c = best;
+                    self.c.path = 0;
+                    self.c.age = age;
                     self.c.pend_since = -1;
                     self.c.cur = CharMeta {
                         conf: bm,
                         doubt: true,
                         alts: top_alts(&mass, 3),
+                        ..CharMeta::default()
                     };
                     let space = get_mass(&spm, c) > SPACE_FRAC * get_mass(&mass, c);
                     if self.c.outshone {
@@ -1424,12 +1492,19 @@ impl Timing {
                     continue;
                 }
             }
+            self.c.path = censored as u8;
+            self.c.age = if self.c.pend_since >= 0 {
+                self.c.ev_base - self.c.pend_since
+            } else {
+                0
+            };
             self.c.pend_since = -1;
             let space = get_mass(&spm, best) > SPACE_FRAC * bm;
             self.c.cur = CharMeta {
                 conf: bm,
                 doubt: false,
                 alts: top_alts(&mass, 3),
+                ..CharMeta::default()
             };
             let held_back = !censored && self.c.guarded && self.c.unsure_char(best);
             if held_back {
@@ -1540,6 +1615,8 @@ impl Timing {
     }
 
     fn flush(&mut self) {
+        self.c.path = 2;
+        self.c.age = 0;
         if self.h.is_empty() {
             return;
         }
@@ -1564,6 +1641,7 @@ impl Timing {
                 conf: bm,
                 doubt: bm < TAU_SOFT,
                 alts: Vec::new(),
+                ..CharMeta::default()
             };
             self.c.emit_char(c as char, false);
         }
@@ -1609,6 +1687,8 @@ impl Timing {
     /// Commits the pending characters at the end of a transmission one by one while the
     /// posterior of the next character (marginalised over all hypotheses) is high enough.
     fn end_chars(&mut self, h: &HSet) {
+        self.c.path = 2;
+        self.c.age = 0;
         let mut h = h.clone();
         loop {
             let mut mass: Vec<(char, f64)> = Vec::new();
@@ -1643,6 +1723,7 @@ impl Timing {
                     &mass.iter().map(|&(c, m)| (c, m / tot)).collect::<Vec<_>>(),
                     3,
                 ),
+                ..CharMeta::default()
             };
             let space = get_mass(&spm, best) > SPACE_FRAC * bm;
             let soft = if self.c.guarded { TAU_COMMIT } else { TAU_SOFT };
