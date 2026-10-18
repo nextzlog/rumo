@@ -9,7 +9,9 @@
 //! committed characters. A character is committed when its posterior (marginalised over
 //! speed and segmentation) exceeds 0.99, or after a number of events at lower thresholds
 //! (doubtful best guesses); an open gap is used as a censored observation so that
-//! commits do not wait for the next mark.
+//! commits do not wait for the next mark. The Morse tree carries a tempered character
+//! frequency prior, so that ambiguous gaps favour whole, likely characters, and the
+//! first character of a track is dropped when it may be the tail of a cut-off one.
 //!
 //! Hypothesis keys are packed integers with interned texts, probability vectors are
 //! fixed-size arrays, and the shifted space likelihoods are shared, cached and pruned by
@@ -71,6 +73,8 @@ const SHIFT_SPACE_MIN: f64 = 0.2;
 /// Relative safety margin of the pruning bounds (covers rounding).
 const BOUND_MARGIN: f64 = 1.000_001;
 const BOUND_MARGIN_TIGHT: f64 = 1.000_000_001;
+/// Power applied to the character frequencies in the Morse-tree prior (0 = flat).
+const PRIOR_POWER: f64 = 0.3;
 /// Prior factor of one-character words.
 const ONE_CHAR_WORD: f64 = 0.25;
 /// Shortest element duration (s).
@@ -134,6 +138,10 @@ pub struct Common {
     pub held_meta: Vec<CharMeta>,
     pub out_meta: Vec<CharMeta>,
     pub inited: bool,
+    /// Silence (s) before the first mark of the track.
+    pub lead: f64,
+    /// Whether the first character has been decided.
+    pub first_done: bool,
 }
 
 impl Common {
@@ -169,6 +177,8 @@ impl Common {
             held_meta: Vec::new(),
             out_meta: Vec::new(),
             inited: false,
+            lead: 0.0,
+            first_done: false,
         }
     }
 
@@ -234,6 +244,14 @@ impl Common {
     }
 
     pub fn emit_char(&mut self, c: char, space: bool) {
+        if !self.first_done {
+            self.first_done = true;
+            if !self.lead_ok(c) {
+                // the first character may be the tail of one cut off by the track start
+                self.cur = CharMeta::default();
+                return;
+            }
+        }
         if space && self.nemit > 0 && !self.spaced {
             self.emit_space(self.confirmed_now);
         }
@@ -241,7 +259,8 @@ impl Common {
         self.held_meta.push(std::mem::take(&mut self.cur));
         self.spaced = false;
         self.nemit += 1;
-        if informative(c) {
+        // doubtful characters do not count towards confirming a track
+        if informative(c) && !self.held_meta.last().is_some_and(|m| m.doubt) {
             self.nchars += 1;
         }
         if self.confirmed_now {
@@ -329,6 +348,14 @@ impl Common {
         self.gw = gw;
     }
 
+    /// Whether the first character c cannot be the tail of a longer character cut off by
+    /// the track start: the silence before its first mark is at least a character gap, or
+    /// its code is not the end of any other code.
+    fn lead_ok(&self, c: char) -> bool {
+        let m = self.means();
+        self.lead >= (m.ie * m.cg).sqrt() * self.best.u || !tail_of_other(c, self.lead <= 0.0)
+    }
+
     /// Whether the open gap is clearly a word gap (word space).
     pub fn word_gap(&self, gap: f64) -> bool {
         let m = self.means();
@@ -355,6 +382,12 @@ struct Tree {
     ok: [bool; 128],
     ch: [u8; 128],
     dah_last: [bool; 128],
+    /// Prior weights of the next mark (dit, dah) at a node, of continuing the character
+    /// after an element space, and of ending it (mean weight 1 over valid branches).
+    w_dit: [f64; 128],
+    w_dah: [f64; 128],
+    w_cont: [f64; 128],
+    w_end: [f64; 128],
 }
 
 fn node_of(code: &str) -> Node {
@@ -382,6 +415,10 @@ fn tree() -> &'static Tree {
             ok: [false; 128],
             ch: [0; 128],
             dah_last: [false; 128],
+            w_dit: [1.0; 128],
+            w_dah: [1.0; 128],
+            w_cont: [1.0; 128],
+            w_end: [1.0; 128],
         };
         for &(c, code) in &MORSE {
             t.ch[node_of(code) as usize] = c as u8;
@@ -391,6 +428,35 @@ fn tree() -> &'static Tree {
         }
         for n in 2..128 {
             t.dah_last[n] = n & 1 == 1;
+        }
+        let mut pc = [0.0; 128];
+        for &(c, code) in &MORSE {
+            pc[node_of(code) as usize] = char_freq(c);
+        }
+        // subtree sums, children before parents
+        let mut sub = pc;
+        for n in (2..128).rev() {
+            sub[n / 2] += sub[n];
+        }
+        // tempered branch probabilities, scaled so that the weights of the valid branches
+        // sum to their number (the total weight of each step is unchanged)
+        let split = |a: f64, b: f64| -> (f64, f64) {
+            let (x, y) = (a.powf(PRIOR_POWER), b.powf(PRIOR_POWER));
+            if a <= 0.0 || b <= 0.0 {
+                return (1.0, 1.0);
+            }
+            (2.0 * x / (x + y), 2.0 * y / (x + y))
+        };
+        for n in 1..64 {
+            let (sd, sh) = (sub[2 * n], sub[2 * n + 1]);
+            let (wd, wh) = split(sd, sh);
+            t.w_dit[n] = wd;
+            t.w_dah[n] = wh;
+            if n > 1 && pc[n] > 0.0 {
+                let (wc, we) = split(sub[n] - pc[n], pc[n]);
+                t.w_cont[n] = wc;
+                t.w_end[n] = we;
+            }
         }
         t
     })
@@ -800,6 +866,11 @@ impl Timing {
                 }
                 let c = cache[slot].as_ref().unwrap();
                 if okd {
+                    let wd = tr.w_dit[k.node as usize];
+                    let mut s2 = [0.0; NG];
+                    for i in 0..NG {
+                        s2[i] = sc[i] * wd;
+                    }
                     nh.add_into(
                         Key {
                             node: dot as Node,
@@ -807,11 +878,15 @@ impl Timing {
                             bi,
                             ..k
                         },
-                        &sc,
+                        &s2,
                         &c.0,
                     );
                 }
                 if okh {
+                    let wh = tr.w_dah[k.node as usize];
+                    for i in 0..NG {
+                        sc[i] *= wh;
+                    }
                     nh.add_into(
                         Key {
                             node: dash as Node,
@@ -1026,13 +1101,22 @@ impl Timing {
             let v = &self.h.vals[idx];
             let (dot, dash) = (child(k.node, false), child(k.node, true));
             if (dot < 128 && tr.ok[dot]) || (dash < 128 && tr.ok[dash]) {
-                nh.add_into(Key { word: false, ..k }, v, &cc[0]);
+                let wc = tr.w_cont[k.node as usize];
+                if wc == 1.0 {
+                    nh.add_into(Key { word: false, ..k }, v, &cc[0]);
+                } else {
+                    let mut w = [0.0; NG];
+                    for i in 0..NG {
+                        w[i] = cc[0][i] * wc;
+                    }
+                    nh.add_into(Key { word: false, ..k }, v, &w);
+                }
             }
             let ch = tr.ch[k.node as usize];
             if ch == 0 {
                 continue;
             }
-            let lp = char_lp(ch as char);
+            let lp = char_lp(ch as char) * tr.w_end[k.node as usize];
             let mut w = [0.0; NG];
             for i in 0..NG {
                 w[i] = cc[1][i] * lp;
@@ -1095,6 +1179,7 @@ impl Timing {
         self.init();
         if !self.c.started {
             if !e.mark {
+                self.c.lead += e.d;
                 return;
             }
             self.c.started = true;
@@ -1380,26 +1465,7 @@ impl Timing {
             return;
         }
         norm_prune(&mut h);
-        let (bk, bm) = Self::best_key(&h);
-        let txt = if bm < END_MIN {
-            Vec::new()
-        } else {
-            self.texts.data[bk.txt as usize].clone()
-        };
-        let mut sp = false;
-        for &c in &txt {
-            if c == b' ' {
-                sp = true;
-                continue;
-            }
-            self.c.cur = CharMeta {
-                conf: bm,
-                doubt: bm < TAU_SOFT,
-                alts: Vec::new(),
-            };
-            self.c.emit_char(c as char, sp);
-            sp = false;
-        }
+        self.end_chars(&h);
         self.c.emit_space(self.c.confirmed_now);
         let mut nh = HSet::default();
         for (idx, k) in h.keys.iter().enumerate() {
@@ -1420,6 +1486,50 @@ impl Timing {
         self.c.evs.clear();
         self.c.lu.clear();
         self.c.pend_since = -1;
+    }
+
+    /// Commits the pending characters at the end of a transmission one by one while the
+    /// posterior of the next character (marginalised over all hypotheses) is high enough.
+    fn end_chars(&mut self, h: &HSet) {
+        let mut h = h.clone();
+        loop {
+            let mut mass: Vec<(char, f64)> = Vec::new();
+            let mut spm: Vec<(char, f64)> = Vec::new();
+            let mut tot = 0.0;
+            for (idx, k) in h.keys.iter().enumerate() {
+                let s = vsum(&h.vals[idx]);
+                tot += s;
+                let (has_sp, c0, _) = self.texts.strip(k.txt);
+                if c0 == 0 {
+                    continue;
+                }
+                add_mass(&mut mass, c0 as char, s);
+                if has_sp {
+                    add_mass(&mut spm, c0 as char, s);
+                }
+            }
+            let Some(&(best, bm)) = mass
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            else {
+                return;
+            };
+            let p = bm / tot;
+            if p < END_MIN {
+                return;
+            }
+            self.c.cur = CharMeta {
+                conf: p,
+                doubt: p < TAU_SOFT,
+                alts: top_alts(
+                    &mass.iter().map(|&(c, m)| (c, m / tot)).collect::<Vec<_>>(),
+                    3,
+                ),
+            };
+            let space = get_mass(&spm, best) > SPACE_FRAC * bm;
+            self.c.emit_char(best, space);
+            h = self.strip_first(&h, best);
+        }
     }
 
     /// Top hypothesis groups of the uncommitted text (best first); cached until the
@@ -1481,6 +1591,31 @@ impl Timing {
         };
         *self.guess_cache.borrow_mut() = (self.gen, n, out.clone());
         out
+    }
+}
+
+/// Whether the code of c could be the end of another character's code; with `cut_mark`
+/// the first mark may itself be cut short (a dah seen as a dit, or the whole character).
+fn tail_of_other(c: char, cut_mark: bool) -> bool {
+    let code = code_of(c);
+    if code.is_empty() {
+        return true;
+    }
+    let alt = format!("-{}", &code[1..]);
+    MORSE.iter().any(|&(_, other)| {
+        (other.len() > code.len() && other.ends_with(code))
+            || (cut_mark && other != code && other.ends_with(alt.as_str()))
+    })
+}
+
+/// Relative frequency of a character in amateur traffic.
+fn char_freq(c: char) -> f64 {
+    match c {
+        'E' => 10.0,
+        'T' | 'A' | 'O' | 'N' => 7.0,
+        'I' | 'S' | 'R' | 'H' => 5.0,
+        'D' | 'L' | 'C' | 'U' | 'M' | 'W' | 'Q' | 'K' => 3.0,
+        _ => 2.0,
     }
 }
 
@@ -1630,10 +1765,14 @@ mod tests {
         }
     }
 
-    fn run() -> (String, Hyp) {
+    fn run(code: &str, lead: f64) -> (String, Hyp) {
         let mut t = Timing::new();
         let u = 0.06;
-        feed(&mut t, "-.-. --.- - . ... -", u);
+        t.add_element(Element {
+            mark: false,
+            d: lead * u,
+        });
+        feed(&mut t, code, u);
         let mut g = 0.0;
         while g < 1.5 {
             g += 0.005;
@@ -1645,9 +1784,50 @@ mod tests {
 
     #[test]
     fn decodes_elements_and_tracks_speed() {
-        let (text, best) = run();
+        let (text, best) = run("-.-. --.- - . ... -", 10.0);
         assert_eq!(text.trim(), "CQTEST");
         assert!((1.2 / best.u - 20.0).abs() < 2.0, "wpm {}", 1.2 / best.u);
+    }
+
+    #[test]
+    fn first_character_needs_a_leading_character_gap() {
+        // the tail of a cut-off C (dah, dit) without a preceding gap is not committed
+        let (text, _) = run("-. --.- - . ... -", 0.0);
+        assert_eq!(text.trim(), "QTEST");
+        let (text, _) = run("-. --.- - . ... -", 0.8);
+        assert_eq!(text.trim(), "QTEST");
+        // a leading silence of a character gap shows the start of the character
+        let (text, _) = run("-. --.- - . ... -", 3.0);
+        assert_eq!(text.trim(), "NQTEST");
+        // a code that ends no other code cannot be a tail
+        let (text, _) = run("--.- - . ... -", 0.8);
+        assert_eq!(text.trim(), "QTEST");
+    }
+
+    #[test]
+    fn tree_prior_prefers_whole_characters() {
+        let tr = tree();
+        let n = |c: &str| node_of(c) as usize;
+        // weights of the valid branches at a node sum to their number
+        for c in ["", "-", "-.", "...", "-.-"] {
+            assert!((tr.w_dit[n(c)] + tr.w_dah[n(c)] - 2.0).abs() < 1e-12);
+            assert!((tr.w_cont[n(c)] + tr.w_end[n(c)] - 2.0).abs() < 1e-12 || c.is_empty());
+        }
+        // a leaf has no alternative to ending; after "-.-" continuing (C, Y) is weighed
+        // against ending as K
+        assert_eq!(tr.w_end[n("-.-.")], 1.0);
+        assert!(tr.w_cont[n("-.-")] > 0.0 && tr.w_end[n("-.-")] > 0.0);
+        // the characters below a dit outweigh E, so ending after one dit weighs less
+        assert!(tr.w_end[n(".")] < 1.0);
+    }
+
+    #[test]
+    fn tails_of_other_codes() {
+        assert!(tail_of_other('N', false) && tail_of_other('J', false));
+        assert!(!tail_of_other('Q', false) && !tail_of_other('5', false));
+        // with a cut first mark, 5 may be the end of 6 and C stays safe
+        assert!(tail_of_other('5', true) && !tail_of_other('C', true));
+        assert!(tail_of_other('*', false));
     }
 
     #[test]

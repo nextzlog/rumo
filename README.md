@@ -66,7 +66,7 @@ flowchart TD
   K --> L[Blend over the first 200 frames of a track]
   R --> L
   L --> M[Soft keyer: explicit-duration HSMM]
-  M -->|marks, spaces and open gap| N[Timing model: speed grid and Morse tree]
+  M -->|marks, spaces and open gap| N[Timing model: speed grid, Morse tree and character prior]
   N --> O[Commit rule]
   O --> P[Events]
 ```
@@ -92,7 +92,7 @@ A track is a candidate until its keying is shown to be Morse from a real station
 stateDiagram-v2
   [*] --> Candidate: residual line persists
   Candidate --> Candidate: evidence below gate, text held
-  Candidate --> Confirmed: evidence and two informative characters
+  Candidate --> Confirmed: evidence and two confident informative characters
   Candidate --> Rejected: onsets follow a stronger neighbour
   Candidate --> Lost: silent 2.5 s
   Confirmed --> Confirmed: commits
@@ -149,8 +149,16 @@ flowchart TD
   E -->|no| F{At least 14 events}
   F -->|no| Z
   F -->|yes| G[Commit best guess as doubtful]
-  H[Silence beyond 1.5 word gaps] --> I[Commit pending text if posterior at least 0.8]
+  H[Silence beyond 1.5 word gaps] --> I[Commit pending characters one by one while posterior at least 0.8]
+  D --> J{First character of the track}
+  G --> J
+  J -->|no| K[Emit]
+  J -->|yes| L{Silence before it at least a character gap, or its code ends no other code}
+  L -->|yes| K
+  L -->|no| M[Drop as a possible cut-off tail]
 ```
+
+The Morse tree carries a character prior: at each node the next dit or dah, and continuing or ending the character, are weighted by tempered character frequencies, so that ambiguous gaps favour whole, likely characters.
 
 ## License
 
