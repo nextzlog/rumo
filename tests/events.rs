@@ -26,6 +26,7 @@ fn track_and_sample(e: &Event) -> (u32, u64) {
         | Event::Commit { track, sample, .. }
         | Event::Tentative { track, sample, .. }
         | Event::Correction { track, sample, .. }
+        | Event::Token { track, sample, .. }
         | Event::TrackLost { track, sample, .. } => (*track, *sample),
     }
 }
@@ -41,6 +42,7 @@ fn event_invariants() {
         confirmed: bool,
         lost: bool,
         candidate: bool,
+        text: Vec<char>,
     }
     let mut st: HashMap<u32, St> = HashMap::new();
     let mut last = 0u64;
@@ -69,6 +71,7 @@ fn event_invariants() {
                 assert!(s.born, "commit before TrackBorn");
                 assert_eq!(text.chars().count(), chars.len());
                 assert_eq!(&chars.iter().map(|c| c.ch).collect::<String>(), text);
+                s.text.extend(text.chars());
                 for c in chars {
                     assert!((0.0..=1.0).contains(&c.p), "{c:?}");
                     if !c.doubtful && c.ch != ' ' {
@@ -82,6 +85,13 @@ fn event_invariants() {
                 assert!(alts.len() <= 3);
             }
             Event::Correction { .. } => panic!("the core never revises"),
+            Event::Token { start, text, .. } => {
+                // a token is a closed stretch of the track's committed text
+                let a = *start as usize;
+                let got: String = s.text[a..a + text.chars().count()].iter().collect();
+                assert_eq!(got.to_ascii_uppercase(), *text);
+                assert!(!text.contains(' '));
+            }
             Event::TrackLost { candidate, .. } => {
                 assert!(s.born);
                 assert_eq!(*candidate, !s.confirmed);

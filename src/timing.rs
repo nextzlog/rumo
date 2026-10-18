@@ -142,6 +142,9 @@ pub struct Common {
     pub lead: f64,
     /// Whether the first character has been decided.
     pub first_done: bool,
+    /// Whether the first character was dropped as a possible cut-off tail and the next
+    /// one followed it without a word space (the first token may be incomplete).
+    pub first_dropped: bool,
     /// Whether a clearly stronger confirmed station is near (set by the decoder).
     pub outshone: bool,
 }
@@ -181,6 +184,7 @@ impl Common {
             inited: false,
             lead: 0.0,
             first_done: false,
+            first_dropped: false,
             outshone: false,
         }
     }
@@ -252,8 +256,12 @@ impl Common {
             if !self.lead_ok(c) {
                 // the first character may be the tail of one cut off by the track start
                 self.cur = CharMeta::default();
+                self.first_dropped = true;
                 return;
             }
+        } else if self.first_dropped && self.nemit == 0 && space {
+            // a word space separates the dropped character from the first token
+            self.first_dropped = false;
         }
         if space && self.nemit > 0 && !self.spaced {
             self.emit_space(self.confirmed_now);

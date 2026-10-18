@@ -2,7 +2,7 @@
 
 mod common;
 use common::*;
-use rumo::{Config, Event};
+use rumo::{Config, Event, TokenKind, Verdict};
 
 const CALL: &str = "CQ TEST DE JA1ZLO JA1ZLO K";
 
@@ -380,4 +380,31 @@ fn weak_station_next_to_strong_one_holds_doubtful_characters() {
             }
         }
     }
+}
+
+#[test]
+fn tokens_of_a_clean_call_are_confirmed() {
+    let (_, x) = single("CQ TEST DE JA1ZLO JA1ZLO K", 25.0, 15.0, 41);
+    let toks: Vec<(String, TokenKind, Verdict)> = decode(&x, 400, Config::default())
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Token {
+                text,
+                kind,
+                verdict,
+                ..
+            } => Some((text, kind, verdict)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        toks.iter()
+            .filter(|t| t.0 == "JA1ZLO")
+            .all(|t| t.1 == TokenKind::Callsign && t.2.confirmed()),
+        "{toks:?}"
+    );
+    assert!(toks.iter().any(|t| t.0 == "JA1ZLO"), "{toks:?}");
+    assert!(toks
+        .iter()
+        .any(|t| t.0 == "DE" && t.1 == TokenKind::Procedure));
 }
