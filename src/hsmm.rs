@@ -73,11 +73,6 @@ const DEFAULT_UNIT: f64 = 1.2 / 22.0;
 const DEFAULT_RATIO: f64 = 3.0;
 const DEFAULT_CHAR_GAP: f64 = 3.0;
 
-/// Mixture over the key-down level (S, S-3 dB, S-6 dB).
-/// Key-down level factors of the fading mixture (0, -3 and -6 dB) and their weights.
-const MIX_F: [f64; 3] = [1.0, 0.5, 0.25];
-const MIX_W: [f64; 3] = [0.6, 0.25, 0.15];
-
 pub struct SoftKeyer {
     dt: f64,
     kappa: f64,
@@ -101,7 +96,6 @@ pub struct SoftKeyer {
     started: bool,
     broad: bool,
     end_lp: [[f64; 3]; 2],
-    mix_lw: [f64; 3],
 }
 
 #[inline]
@@ -146,7 +140,6 @@ impl SoftKeyer {
                 ],
                 [P_AFTER_GAP.ln(), P_AFTER_GAP.ln(), 0.0],
             ],
-            mix_lw: [MIX_W[0].ln(), MIX_W[1].ln(), MIX_W[2].ln()],
         };
         let last = first(E_G7) + K_MAX - 1;
         s.delta[last] = 0.0;
@@ -217,17 +210,14 @@ impl SoftKeyer {
         first(j) + K_MAX - self.k[j]
     }
 
-    /// Consumes one frame (x = power / noise power, S = key-down SNR) and emits elements with a fixed lag.
-    pub fn step(&mut self, x: f64, s_db: f64, mut emit: impl FnMut(Element)) {
-        let mut l0 = NEG_INF;
-        for i in 0..3 {
-            let sk = s_db * MIX_F[i];
-            if i > 0 && sk < 2.0 {
-                break;
-            }
-            l0 = logadd(l0, self.mix_lw[i] - sk + ln_i0(2.0 * (sk * x).sqrt()));
-        }
-        let llr = self.kappa * l0;
+    /// Tempered Rician log-likelihood ratio of key down versus key up for one frame
+    /// (x = power / noise power, s = key-down SNR).
+    pub fn rician_llr(&self, x: f64, s: f64) -> f64 {
+        self.kappa * (-s + ln_i0(2.0 * (s * x).sqrt()))
+    }
+
+    /// Consumes one frame given its key-down log-likelihood ratio and emits elements with a fixed lag.
+    pub fn step(&mut self, llr: f64, mut emit: impl FnMut(Element)) {
         self.nd = [NEG_INF; N_STATES];
         self.na = [NEG_INF; N_STATES];
         let bpi = self.t % LAG;
@@ -396,7 +386,8 @@ mod tests {
         for &(on, n) in &pattern {
             for _ in 0..n {
                 let x = if on { 100.0 } else { 1.0 };
-                sk.step(x, 99.0, |e| els.push(e));
+                let llr = sk.rician_llr(x, 99.0);
+                sk.step(llr, |e| els.push(e));
             }
         }
         let marks: Vec<f64> = els.iter().filter(|e| e.mark).map(|e| e.d).collect();
@@ -418,7 +409,8 @@ mod tests {
             s ^= s >> 7;
             s ^= s << 17;
             let u = (s >> 11) as f64 / (1u64 << 53) as f64;
-            sk.step(-(u.max(1e-12)).ln(), 2.0, |_| {});
+            let llr = sk.rician_llr(-(u.max(1e-12)).ln(), 2.0);
+            sk.step(llr, |_| {});
         }
         assert!(sk.evidence(300) < 8.0, "{}", sk.evidence(300));
     }

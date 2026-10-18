@@ -1,13 +1,10 @@
 //! Hard keyer: turns a track's power series into marks and spaces with
 //! fading-following thresholds; also maintains the track's noise and key-down levels.
 
-use crate::model::GAMMA;
 use crate::Element;
 
-/// Smallest key-down level relative to the noise with the unbiased (log-domain) floor.
-const PEAK_FLOOR: f64 = 8.0;
-/// Smallest key-down level relative to the noise with the conservative (linear) floor.
-const PEAK_FLOOR_LINEAR: f64 = 4.0;
+/// Smallest key-down level relative to the noise.
+const PEAK_FLOOR: f64 = 4.0;
 /// The power smoother spans one unit divided by this (at most `SMOOTH_MAX` frames).
 const SMOOTH_DIV: f64 = 3.0;
 const SMOOTH_MAX: i64 = 6;
@@ -24,12 +21,8 @@ const HYSTERESIS_DB: f64 = 1.0;
 /// Fast attack and slow release of the key-down level.
 const ATTACK: f64 = 0.5;
 const RELEASE: f64 = 0.03;
-/// Update rate of the linear noise floor.
+/// Update rate of the noise floor (mean of the smoothed power during spaces).
 const NOISE_RATE: f64 = 0.02;
-/// Update rate of the log-domain noise floor.
-const LOG_NOISE_RATE: f64 = 0.03;
-/// Frames after a transition before the log-domain floor is updated.
-const SETTLE: i64 = 3;
 /// Smallest noise level relative to the key-down level.
 const NOISE_MIN_REL: f64 = 1e-7;
 /// Decay per frame of the key-down level during silence.
@@ -46,11 +39,7 @@ pub struct Keyer {
     pub min_run: i64,
     /// Frames since the last mark ended (for death).
     pub last_on: i64,
-    marks: i64,
-    snr_peak: f64,
-    logn: f64,
     noise_c: f64,
-    pub unbiased: bool,
 }
 
 impl Keyer {
@@ -65,11 +54,7 @@ impl Keyer {
             hold: 0,
             min_run: 2,
             last_on: 0,
-            marks: 0,
-            snr_peak: 0.0,
-            logn: 0.0,
             noise_c: 0.0,
-            unbiased: false,
         }
     }
 
@@ -113,9 +98,6 @@ impl Keyer {
             if self.hold >= self.min_run {
                 let d = self.run as f64 * self.dt;
                 emit(Element { mark: self.on, d });
-                if self.on {
-                    self.marks += 1;
-                }
                 self.on = want;
                 self.run = self.hold;
                 self.hold = 0;
@@ -131,34 +113,15 @@ impl Keyer {
                 self.peak = (1.0 - RELEASE) * self.peak + RELEASE * s;
             }
             self.last_on = 0;
-            if ldb > self.snr_peak {
-                self.snr_peak = ldb;
-            }
         } else {
             self.last_on += 1;
             if self.noise_c == 0.0 {
                 self.noise_c = self.noise;
             }
             self.noise_c = (1.0 - NOISE_RATE) * self.noise_c + NOISE_RATE * s;
-            // log-domain (geometric) mean of raw frame power, away from transitions
-            if self.logn == 0.0 {
-                self.logn = self.noise.ln() - GAMMA;
-            }
-            if self.run > SETTLE && self.hold == 0 {
-                self.logn += LOG_NOISE_RATE * (e.max(self.peak * NOISE_MIN_REL).ln() - self.logn);
-            }
-            if self.unbiased {
-                self.noise = (self.logn + GAMMA).exp();
-            } else {
-                self.noise = self.noise_c;
-            }
+            self.noise = self.noise_c;
             self.noise = self.noise.max(self.peak * NOISE_MIN_REL);
-            let pf = if self.unbiased {
-                PEAK_FLOOR
-            } else {
-                PEAK_FLOOR_LINEAR
-            };
-            self.peak = (self.noise * pf).max(self.peak * PEAK_DECAY);
+            self.peak = (self.noise * PEAK_FLOOR).max(self.peak * PEAK_DECAY);
         }
     }
 

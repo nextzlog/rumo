@@ -13,6 +13,8 @@ mod frontend;
 mod hsmm;
 mod keyer;
 mod model;
+mod nn;
+mod nn_weights;
 mod special;
 mod timing;
 

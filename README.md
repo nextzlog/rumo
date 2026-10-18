@@ -58,14 +58,32 @@ flowchart TD
   E --> F[Birth candidates with skirt masking]
   F -->|persists 4 frames| G[New track with look-back replay of 0.8 s]
   C --> H[Track amplitude per frame]
+  G --> H
   H --> I[Phase-advance frequency refinement]
   H --> J[Level keyer: noise and key-down levels]
-  J --> K[Soft keyer: explicit-duration HSMM]
-  K -->|marks and spaces| L[Timing model: speed grid and Morse tree]
-  K -->|open gap| L
-  L --> M[Commit rule]
-  M --> N[Events]
-  G --> H
+  H --> K[Key-state network]
+  J --> R[Rician likelihood]
+  K --> L[Blend over the first 200 frames of a track]
+  R --> L
+  L --> M[Soft keyer: explicit-duration HSMM]
+  M -->|marks, spaces and open gap| N[Timing model: speed grid and Morse tree]
+  N --> O[Commit rule]
+  O --> P[Events]
+```
+
+The key-state network turns seven features per track and frame into a key-down likelihood.
+
+```mermaid
+flowchart LR
+  A[Own log power over noise reference] --> F[Normalise]
+  B[Own log power over bin floor] --> F
+  C[Own phase consistency] --> F
+  D[Own log power below peak] --> F
+  E[Strongest neighbour within 300 Hz: power, offset, phase consistency] --> F
+  F --> G[GRU, 24 units]
+  G --> H[Linear output over temperature]
+  H --> I[Logit minus prior logit, times 0.75, clipped to 8]
+  I --> J[Key-down log-likelihood ratio]
 ```
 
 A track is a candidate until its keying is shown to be Morse from a real station.
@@ -112,7 +130,7 @@ sequenceDiagram
   loop every completed frame
     Decoder->>Decoder: FFT, joint fit, noise floor
     Decoder->>Track: amplitude
-    Track->>Track: keyers, timing, commit rule
+    Track->>Track: network, keyers, timing, commit rule
     Decoder->>Decoder: births and deaths
     Decoder-->>App: TrackBorn, Commit, TrackConfirmed, Tentative, TrackLost
   end
