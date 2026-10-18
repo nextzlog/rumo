@@ -75,7 +75,12 @@ fn event_invariants() {
                 for c in chars {
                     assert!((0.0..=1.0).contains(&c.p), "{c:?}");
                     if !c.doubtful && c.ch != ' ' {
-                        assert!(c.p >= 0.9 || c.alts.is_empty(), "{c:?}");
+                        // the first alternative is the character itself with its calibrated p
+                        assert!(
+                            c.alts.is_empty()
+                                || (c.alts[0].ch == c.ch && (c.alts[0].p - c.p).abs() < 1e-9),
+                            "{c:?}"
+                        );
                     }
                 }
             }

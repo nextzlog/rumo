@@ -192,7 +192,7 @@ pub struct Track {
     pub key: Keyer,
     pub tim: Timing,
     pub confirmed: bool,
-    born: i64,
+    pub born: i64,
     pub level: f64,
     edges: VecDeque<Edge>,
     peak_e: f64,
@@ -1067,6 +1067,8 @@ fn advance(
     }
     // frames under a louder neighbour's keying edges carry little evidence either way
     llr /= 1.0 + leak / t.level.max(t.key.noise);
+    t.tim.c.snr_db = 10.0 * (t.key.peak / t.key.noise).max(1e-3).log10();
+    t.tim.c.fade_db = 10.0 * (t.level / t.peak_e.max(1e-30)).clamp(1e-3, 1.0).log10();
     // a weak station next to a clearly stronger one holds doubtful characters back
     let lvl = t.level * 10f64.powf(OUTSHONE_DB / 10.0);
     t.tim.c.outshone = others_iter(others)

@@ -6,6 +6,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+mod calib;
 mod complex;
 mod decoder;
 mod fft;
@@ -93,7 +94,7 @@ impl Default for Config {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Char {
     pub ch: char,
-    /// Posterior mass of the character at commit time.
+    /// Calibrated probability that the character is right.
     pub p: f64,
     /// Forced best guess (the posterior stayed below the staged commit threshold).
     pub doubtful: bool,
@@ -133,7 +134,7 @@ pub enum Event {
         pattern: String,
         /// Character of the open pattern if it ended now.
         guess: String,
-        /// Probability of the most probable group.
+        /// Calibrated probability of the most probable group.
         p: f64,
         /// Next hypothesis groups.
         alts: Vec<Guess>,
@@ -155,6 +156,9 @@ pub enum Event {
         text: String,
         kind: TokenKind,
         verdict: Verdict,
+        /// Calibrated probability that the token is right (callsigns; for other kinds the
+        /// product of its character probabilities).
+        p: f64,
     },
     /// The track ended; `candidate` true means a rejected candidate.
     TrackLost {
@@ -184,6 +188,8 @@ pub struct TrackState {
     pub evidence: f64,
     /// Held text of a candidate.
     pub held: Vec<Char>,
+    /// Calibrated probability that the track is a station.
+    pub p_station: f64,
     /// Top hypothesis groups of the uncommitted text.
     pub guesses: Vec<Guess>,
 }
@@ -192,6 +198,8 @@ struct Known {
     confirmed: bool,
     tent: String,
     reader: syntax::Reader,
+    /// Station probability at the last commit.
+    p_station: f64,
 }
 
 /// The streaming decoder.
@@ -200,6 +208,27 @@ pub struct Decoder {
     sample: u64,
     tracks: BTreeMap<u32, Known>,
     ev: Vec<Event>,
+    features: Option<Vec<(u32, f64, [f32; calib::NF])>>,
+    token_log: Option<Vec<(u32, String, [f32; calib::NT])>>,
+}
+
+/// Station features of a track.
+fn station_features(c: &Core, t: &decoder::Track) -> [f32; calib::NS] {
+    let ev =
+        t.sk.as_ref()
+            .map(|s| s.evidence(c.cfg.ev_win))
+            .unwrap_or(0.0);
+    calib::station_features(
+        ev,
+        t.tim.c.snr_db,
+        t.tim.c.llr,
+        t.tim.c.nemit,
+        t.tim.nchars(),
+        t.confirmed,
+        t.tim.c.outshone,
+        t.tim.c.guarded,
+        (c.frame_no - t.born) as f64 * c.frame_seconds(),
+    )
 }
 
 fn round1(x: f64) -> f64 {
@@ -225,6 +254,8 @@ impl Decoder {
             sample: 0,
             tracks: BTreeMap::new(),
             ev: Vec::new(),
+            features: None,
+            token_log: None,
         }
     }
 
@@ -283,6 +314,7 @@ impl Decoder {
                     confirmed: t.confirmed,
                     tent: String::new(),
                     reader: syntax::Reader::default(),
+                    p_station: 0.5,
                 });
                 self.ev.push(Event::TrackBorn {
                     track: t.id,
@@ -314,7 +346,7 @@ impl Decoder {
                 continue;
             }
             let held: String = t.tim.held().iter().collect();
-            let gs = t.tim.guesses(4);
+            let gs = calib::guesses(&t.tim.guesses(4), |p| t.tim.c.guess_features(p));
             let (mut text, mut pattern, mut guess, mut p, mut alts) =
                 (String::new(), String::new(), String::new(), 0.0, Vec::new());
             if let Some(g) = gs.first() {
@@ -365,12 +397,14 @@ impl Decoder {
             .chars()
             .enumerate()
             .map(|(i, ch)| match o.meta.get(i) {
-                Some(m) => Char {
-                    ch,
-                    p: round3(m.conf),
-                    doubtful: m.doubt,
-                    alts: m.alts.clone(),
-                },
+                Some(m) => {
+                    if let Some(log) = self.features.as_mut() {
+                        if ch != ' ' {
+                            log.push((o.track, m.conf, m.feat));
+                        }
+                    }
+                    calib::character(m, ch)
+                }
                 None => Char {
                     ch,
                     p: 1.0,
@@ -379,17 +413,19 @@ impl Decoder {
                 },
             })
             .collect::<Vec<Char>>();
-        let dropped = self
-            .core
-            .tracks
-            .iter()
-            .any(|t| t.id == o.track && t.tim.c.first_dropped);
+        let core_track = self.core.tracks.iter().find(|t| t.id == o.track);
+        let dropped = core_track.is_some_and(|t| t.tim.c.first_dropped);
+        let ps = core_track.map(|t| calib::station_p(&station_features(&self.core, t)));
         let toks = match self.tracks.get_mut(&o.track) {
             Some(k) => {
                 if dropped {
                     k.reader.truncate_first();
                 }
-                k.reader.feed(chars.iter().map(|c| (c.ch, c.doubtful)))
+                if let Some(p) = ps {
+                    k.p_station = p;
+                }
+                k.reader
+                    .feed_p(chars.iter().map(|c| (c.ch, c.doubtful, c.p)))
             }
             None => Vec::new(),
         };
@@ -404,7 +440,21 @@ impl Decoder {
     }
 
     fn push_tokens(&mut self, track: u32, sample: u64, toks: Vec<syntax::Token>) {
+        let ps = self.tracks.get(&track).map(|k| k.p_station).unwrap_or(0.5);
         for t in toks {
+            let p = if t.kind == TokenKind::Callsign {
+                let valid = matches!(
+                    t.verdict,
+                    Verdict::Confirmed | Verdict::Repeated | Verdict::DoubtfulCharacter
+                );
+                let f = calib::token_features(t.min_lp, t.sum_lp, valid, t.repeat, ps);
+                if let Some(log) = self.token_log.as_mut() {
+                    log.push((track, t.text.clone(), f));
+                }
+                calib::token_p(&f)
+            } else {
+                t.sum_lp.exp()
+            };
             self.ev.push(Event::Token {
                 track,
                 sample,
@@ -412,8 +462,31 @@ impl Decoder {
                 text: t.text,
                 kind: t.kind,
                 verdict: t.verdict,
+                p: round3(p),
             });
         }
+    }
+
+    /// Station features of all live tracks: (track, frequency, features), for fitting.
+    #[doc(hidden)]
+    pub fn station_features(&self) -> Vec<(u32, f64, Vec<f32>)> {
+        let c = &self.core;
+        c.tracks
+            .iter()
+            .map(|t| (t.id, c.hz(t.nu), station_features(c, t).to_vec()))
+            .collect()
+    }
+
+    /// Takes the recorded callsign-confidence inputs: (track, text, features).
+    #[doc(hidden)]
+    pub fn take_token_features(&mut self) -> Vec<(u32, String, Vec<f32>)> {
+        self.token_log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(t, s, f)| (t, s, f.to_vec()))
+            .collect()
     }
 
     /// Live tracks sorted by frequency.
@@ -435,7 +508,8 @@ impl Decoder {
                     key_on: t.key.on,
                     evidence: 0.0,
                     held: Vec::new(),
-                    guesses: t.tim.guesses(4),
+                    guesses: calib::guesses(&t.tim.guesses(4), |p| t.tim.c.guess_features(p)),
+                    p_station: round3(calib::station_p(&station_features(c, t))),
                 };
                 if t.key.noise > 0.0 && t.key.peak > 0.0 {
                     s.snr = round1(10.0 * (t.key.peak / t.key.noise).log10());
@@ -462,11 +536,17 @@ impl Decoder {
                     .held()
                     .iter()
                     .enumerate()
-                    .map(|(i, &ch)| Char {
-                        ch,
-                        p: meta.get(i).map(|m| round3(m.conf)).unwrap_or(1.0),
-                        doubtful: meta.get(i).map(|m| m.doubt).unwrap_or(false),
-                        alts: Vec::new(),
+                    .map(|(i, &ch)| match meta.get(i) {
+                        Some(m) => Char {
+                            alts: Vec::new(),
+                            ..calib::character(m, ch)
+                        },
+                        None => Char {
+                            ch,
+                            p: 1.0,
+                            doubtful: false,
+                            alts: Vec::new(),
+                        },
                     })
                     .collect();
                 s
@@ -486,6 +566,26 @@ impl Decoder {
     /// Number of analysis frames processed so far.
     pub fn frame_count(&self) -> i64 {
         self.core.frame_no
+    }
+
+    /// Starts recording the calibrator inputs of committed characters (for fitting).
+    #[doc(hidden)]
+    pub fn record_features(&mut self, on: bool) {
+        self.features = if on { Some(Vec::new()) } else { None };
+        self.token_log = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Takes the recorded calibrator inputs: (track, raw probability, features) per
+    /// committed non-space character, in commit order.
+    #[doc(hidden)]
+    pub fn take_features(&mut self) -> Vec<(u32, f64, Vec<f32>)> {
+        self.features
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(t, p, f)| (t, p, f.to_vec()))
+            .collect()
     }
 
     /// Starts recording the keyer output of all tracks (for diagnostics and feedback traces).
