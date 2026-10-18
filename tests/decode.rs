@@ -161,7 +161,6 @@ fn mid_stream_start_decodes_the_rest() {
 }
 
 #[test]
-#[ignore = "known limitation: the tail of a cut-off first character is committed (here N for the end of C)"]
 fn mid_stream_start_commits_no_wrong_character() {
     let (_, x) = single("CQ TEST DE JA1ZLO K", 25.0, 15.0, 9);
     let cut = (0.75 * RATE as f64) as usize;
@@ -346,4 +345,19 @@ fn other_sample_rates() {
         assert_eq!(t.len(), 1, "{rate} Hz: {t:?}");
         assert_eq!(t[0].2, "TEST JA1ZLO", "{rate} Hz");
     }
+}
+
+#[test]
+fn jitter_30_percent_keeps_characters_whole() {
+    // intra-character gaps as long as character gaps must not split characters
+    let mut sum = 0.0;
+    for seed in 1..=6 {
+        let mut s = Station::new("CQ TEST DE JA1ZLO K", 700.0, 22.0);
+        s.jitter = 0.3;
+        s.seed = 20 + seed;
+        let x = scene(std::slice::from_ref(&s), s.end() + 3.0, 20.0, 20 + seed);
+        let t = texts(&decode(&x, 400, Config::default()));
+        sum += t.first().map_or(1.0, |t| cer(&t.2, &s.text));
+    }
+    assert!(sum / 6.0 <= 0.35, "mean CER {}", sum / 6.0);
 }
