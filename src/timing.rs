@@ -142,6 +142,8 @@ pub struct Common {
     pub lead: f64,
     /// Whether the first character has been decided.
     pub first_done: bool,
+    /// Whether a clearly stronger confirmed station is near (set by the decoder).
+    pub outshone: bool,
 }
 
 impl Common {
@@ -179,6 +181,7 @@ impl Common {
             inited: false,
             lead: 0.0,
             first_done: false,
+            outshone: false,
         }
     }
 
@@ -825,6 +828,7 @@ impl Timing {
     }
 
     fn step_mark(&mut self, d: f64) -> HSet {
+        let pon = self.prior_on();
         let tb = tables();
         let tr = tree();
         let mut cache: [Option<Box<MarkLiks>>; 5] = Default::default();
@@ -866,7 +870,7 @@ impl Timing {
                 }
                 let c = cache[slot].as_ref().unwrap();
                 if okd {
-                    let wd = tr.w_dit[k.node as usize];
+                    let wd = if pon { tr.w_dit[k.node as usize] } else { 1.0 };
                     let mut s2 = [0.0; NG];
                     for i in 0..NG {
                         s2[i] = sc[i] * wd;
@@ -883,7 +887,7 @@ impl Timing {
                     );
                 }
                 if okh {
-                    let wh = tr.w_dah[k.node as usize];
+                    let wh = if pon { tr.w_dah[k.node as usize] } else { 1.0 };
                     for i in 0..NG {
                         sc[i] *= wh;
                     }
@@ -1064,6 +1068,7 @@ impl Timing {
     }
 
     fn step_space(&mut self, d: f64, censored: bool) -> HSet {
+        let pon = self.prior_on();
         let tb = tables();
         let tr = tree();
         let mut cache: [Option<Box<SpaceLiks>>; 5] = Default::default();
@@ -1101,7 +1106,7 @@ impl Timing {
             let v = &self.h.vals[idx];
             let (dot, dash) = (child(k.node, false), child(k.node, true));
             if (dot < 128 && tr.ok[dot]) || (dash < 128 && tr.ok[dash]) {
-                let wc = tr.w_cont[k.node as usize];
+                let wc = if pon { tr.w_cont[k.node as usize] } else { 1.0 };
                 if wc == 1.0 {
                     nh.add_into(Key { word: false, ..k }, v, &cc[0]);
                 } else {
@@ -1116,7 +1121,7 @@ impl Timing {
             if ch == 0 {
                 continue;
             }
-            let lp = char_lp(ch as char) * tr.w_end[k.node as usize];
+            let lp = char_lp(ch as char) * if pon { tr.w_end[k.node as usize] } else { 1.0 };
             let mut w = [0.0; NG];
             for i in 0..NG {
                 w[i] = cc[1][i] * lp;
@@ -1162,6 +1167,12 @@ impl Timing {
             }
         }
         nh
+    }
+
+    /// Whether the character prior applies: not on a track outshone by a nearby station,
+    /// whose spurious elements the prior would turn into confident characters.
+    fn prior_on(&self) -> bool {
+        !self.c.outshone
     }
 
     fn marginal(&self) -> [f64; NG] {
@@ -1308,7 +1319,9 @@ impl Timing {
                         alts: top_alts(&mass, 3),
                     };
                     let space = get_mass(&spm, c) > SPACE_FRAC * get_mass(&mass, c);
-                    if bm >= GUESS_MIN {
+                    if self.c.outshone {
+                        // next to a stronger station a doubtful character is held back
+                    } else if bm >= GUESS_MIN {
                         self.c.emit_char(c, space);
                     } else {
                         self.c.emit_char('*', space);
@@ -1527,7 +1540,9 @@ impl Timing {
                 ),
             };
             let space = get_mass(&spm, best) > SPACE_FRAC * bm;
-            self.c.emit_char(best, space);
+            if p >= TAU_SOFT || !self.c.outshone {
+                self.c.emit_char(best, space);
+            }
             h = self.strip_first(&h, best);
         }
     }

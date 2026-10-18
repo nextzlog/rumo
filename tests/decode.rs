@@ -361,3 +361,23 @@ fn jitter_30_percent_keeps_characters_whole() {
     }
     assert!(sum / 6.0 <= 0.35, "mean CER {}", sum / 6.0);
 }
+
+#[test]
+fn weak_station_next_to_strong_one_holds_doubtful_characters() {
+    for seed in 1..=4 {
+        let a = Station::new("CQ TEST DE JA1ZLO JA1ZLO K", 700.0, 25.0);
+        let mut w = Station::new("JH1ABC 5NN 1317M TU", 800.0, 21.0);
+        w.seed = 30 + seed;
+        w.start = 0.9;
+        w.amp = 0.03; // 20 dB weaker
+        let secs = a.end().max(w.end()) + 3.0;
+        let x = scene(&[a.clone(), w.clone()], secs, 25.0, 30 + seed);
+        for e in decode(&x, 400, Config::default()) {
+            if let Event::Commit { freq, chars, .. } = e {
+                if (freq - 800.0).abs() < 30.0 {
+                    assert!(chars.iter().all(|c| !c.doubtful), "seed {seed}: {chars:?}");
+                }
+            }
+        }
+    }
+}
