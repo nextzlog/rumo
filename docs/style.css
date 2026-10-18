@@ -93,6 +93,7 @@ select { padding: 0 .5rem; min-width: 0; }
 .guess { font-style: italic; }
 .pat { margin-left: .35em; letter-spacing: .08em; }
 .doubt { text-decoration: underline wavy var(--doubt) 1px; text-underline-offset: 4px; }
+.dtok { text-decoration: underline dotted var(--doubt) 1px; text-underline-offset: 4px; }
 .empty { color: var(--muted); font-size: .9rem; padding: .3rem 0; }
 
 /* report dialog */

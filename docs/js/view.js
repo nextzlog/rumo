@@ -137,7 +137,8 @@
   // ------------------------------------------------------------ lanes
   const patGlyphs = (p) => (p || "").replace(/\./g, "·").replace(/-/g, "–");
 
-  // Text segments of a lane: committed characters (class "" or "doubt"), held
+  // Text segments of a lane: committed characters (class "", "doubt" or "dtok" for a
+  // character of a doubtful callsign or exchange token), held
   // candidate text ("held"), tentative text ("tent"), the best guess of the open
   // character ("guess") and its dot/dash pattern ("pat").  Consecutive characters
   // of the same class are merged.  maxChars bounds the committed history shown.
@@ -146,11 +147,12 @@
     const push = (text, cls, title) => {
       if (!text) return;
       const last = segs[segs.length - 1];
-      if (last && last.cls === cls && !title && !last.title) last.text += text;
+      if (last && last.cls === cls && last.title === title) last.text += text;
       else segs.push(title ? { text, cls, title } : { text, cls });
     };
     for (const c of t.committed.slice(-(maxChars || 240))) {
       if (c.d && c.ch !== " ") push(c.ch, "doubt", charTitle(c));
+      else if (c.tok) push(c.ch, "dtok", TOKEN_REASON[c.tok] || "要確認");
       else push(c.ch, "");
     }
     if (t.held) push(t.held, "held");
@@ -160,6 +162,15 @@
     }
     return segs;
   }
+
+  const TOKEN_REASON = {
+    "doubtful-character": "不確かな文字を含む語",
+    invalid: "コールサインや交換の書式に合わない",
+    "run-together": "二つの語がつながっている可能性",
+    unknown: "未知の語",
+    truncated: "先頭の文字が欠けている可能性",
+    partial: "先に読んだコールサインの一部",
+  };
 
   function charTitle(c) {
     if (c.p === undefined || c.p === null) return "不確か";

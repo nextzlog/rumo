@@ -131,7 +131,7 @@
     let t = tracks.get(id);
     if (!t) {
       t = { id, freq: 0, snr: null, wpm: null, candidate: true, alive: true, keyOn: false,
-        committed: [], held: "", tent: null, endedAt: 0, rev: 0 };
+        committed: [], base: 0, held: "", tent: null, endedAt: 0, rev: 0 };
       tracks.set(id, t);
     }
     return t;
@@ -145,8 +145,19 @@
         const t = track(e.track);
         if (e.freq) t.freq = e.freq;
         for (const c of e.chars || []) t.committed.push({ ch: c.ch, p: c.p, d: c.doubtful, alts: c.alts });
-        if (t.committed.length > 4000) t.committed.splice(0, t.committed.length - 4000);
+        if (t.committed.length > 4000) { const k = t.committed.length - 4000; t.committed.splice(0, k); t.base += k; }
         t.held = ""; t.rev++;
+        break;
+      }
+      case "Token": {
+        // a doubtful token marks its characters (start indexes the track's committed text)
+        const t = tracks.get(e.track);
+        if (!t || e.confirmed) break;
+        for (let i = 0; i < (e.text || "").length; i++) {
+          const c = t.committed[e.start - t.base + i];
+          if (c) c.tok = e.reason;
+        }
+        t.rev++;
         break;
       }
       case "Tentative": {

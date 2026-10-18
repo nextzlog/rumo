@@ -122,6 +122,7 @@ pub fn kind(e: &Event) -> &'static str {
         Event::Commit { .. } => "Commit",
         Event::Tentative { .. } => "Tentative",
         Event::Correction { .. } => "Correction",
+        Event::Token { .. } => "Token",
         Event::TrackLost { .. } => "TrackLost",
     }
 }
@@ -222,6 +223,22 @@ pub fn write_event(e: &Event, out: &mut String) {
             o.int("sample", *sample);
             o.int("retract", *retract as u64);
             o.str("text", text);
+        }
+        Event::Token {
+            track,
+            sample,
+            start,
+            text,
+            kind,
+            verdict,
+        } => {
+            o.int("track", *track as u64);
+            o.int("sample", *sample);
+            o.int("start", *start as u64);
+            o.str("text", text);
+            o.str("kind", kind.name());
+            o.bool("confirmed", verdict.confirmed());
+            o.str("reason", verdict.name());
         }
         Event::TrackLost {
             track,
