@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>みんなで鍛える、モールス解読機β</title>
+<script>try { var t = localStorage.getItem("rumo.theme"); if (t) document.documentElement.dataset.theme = JSON.parse(t); } catch (e) {}</script>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>みんなで鍛える、モールス解読機β</h1>
+    <p class="lead">マイクを向けるとモールスを文字にします。間違いを教えてもらうほど賢くなります。</p>
+  </div>
+  <nav>
+    <a href="about.html">このサイトについて</a>
+    <button id="theme" class="quiet" type="button">ライト</button>
+  </nav>
+</header>
+
+<main>
+  <section class="toolbar" aria-label="音声の入力">
+    <select id="device" aria-label="マイク"><option value="">既定のマイク</option></select>
+    <button id="start" class="primary" type="button" disabled>開始</button>
+    <button id="stop" type="button" disabled>停止</button>
+    <button id="open" type="button" disabled>WAVを開く</button>
+    <input id="file" type="file" accept=".wav,audio/*" hidden>
+    <label class="check"><input id="showCand" type="checkbox" checked> 候補も表示</label>
+  </section>
+  <p id="status" class="status" role="status">解読機を読み込んでいます…</p>
+
+  <section class="monitor" aria-label="ウォーターフォール">
+    <div id="wf" class="wf">
+      <canvas id="wfCanvas" aria-hidden="true"></canvas>
+      <div id="markers" class="markers"></div>
+    </div>
+    <div id="scale" class="scale" aria-hidden="true"></div>
+  </section>
+
+  <section aria-label="局ごとの解読結果">
+    <ol id="lanes" class="lanes" aria-label="局ごとの解読結果(周波数順)"></ol>
+    <p id="empty" class="empty">まだ局がありません。「開始」でマイクから聞き取るか、WAV録音を開いてください。</p>
+  </section>
+
+  <details class="advanced">
+    <summary>詳細設定</summary>
+    <label class="check"><input id="ringOn" type="checkbox"> 直近30秒の音声をメモリに保持して保存できるようにする(既定はオフ)</label>
+    <p><button id="saveWav" type="button" disabled>直近30秒をWAVで保存(8 kHz, 16 bit)</button></p>
+    <p class="hint">音声はご自身で共有しない限り端末の外に出ません。
+      共有する場合は、お好きな場所にアップロードし、そのリンクを訂正の欄に書き添えてください。</p>
+  </details>
+</main>
+
+<dialog id="report" aria-labelledby="reportTitle">
+  <form method="dialog" id="reportForm">
+    <h2 id="reportTitle">間違いを教える</h2>
+    <p class="hint">実際に聞こえた文字を入力してください。このページからは何も送信されません。Googleフォームが開くので、内容を確かめてから送信するかどうかを決めてください(<a href="about.html" target="_blank" rel="noopener">このサイトについて</a>)。</p>
+    <p class="field-label">解読結果 <span id="repFreq"></span></p>
+    <p id="repDecoded" class="decoded"></p>
+    <label class="field-label" for="repCorrect">実際に聞こえた文字</label>
+    <textarea id="repCorrect" rows="3" spellcheck="false" autocapitalize="characters"></textarea>
+    <label class="check"><input id="withTrace" type="checkbox" checked> 解読の記録(符号の長さと文字の確率。音声は含みません)を添付する</label>
+    <p id="repMsg" class="hint" hidden></p>
+    <div class="actions">
+      <button id="repCancel" value="cancel" type="submit">閉じる</button>
+      <button id="repCopy" type="button" hidden>報告をコピー</button>
+      <button id="repSend" class="primary" type="button">フォームを開く</button>
+    </div>
+  </form>
+</dialog>
+
+<footer class="foot">
+  <span id="versions">rumo-web</span>
+  <span>コード: MIT ライセンス(Copyright (c) 2026 JG1VPP &amp; JS2FVO)/ 報告: CC BY 4.0(<a href="about.html">このサイトについて</a>)</span>
+</footer>
+
+<script src="config.js"></script>
+<script src="js/trace-codec.js"></script>
+<script src="js/wav.js"></script>
+<script src="js/view.js"></script>
+<script src="js/waterfall.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

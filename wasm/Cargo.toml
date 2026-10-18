@@ -1,0 +1,19 @@
+[package]
+name = "rumo-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly build of rumo for the web app (plain C ABI)"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rumo = { path = ".." }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

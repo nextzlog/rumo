@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>このサイトについて | みんなで鍛える、モールス解読機β</title>
+<script>try { var t = localStorage.getItem("rumo.theme"); if (t) document.documentElement.dataset.theme = JSON.parse(t); } catch (e) {}</script>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<header class="bar">
+  <h1>このサイトについて</h1>
+  <nav><a href="index.html">解読機に戻る</a> · <a href="#en" lang="en">English</a></nav>
+</header>
+<main class="doc">
+
+<h2>このサイトでできること</h2>
+<p>マイクから入る音声や、手元のWAV録音に含まれるモールス符号(CW)を文字に変換して表示します。
+複数の局が同時に聞こえている場合は、周波数ごとに分けて解読します。
+解読を間違えたときに正しい文字を教えていただくと、その情報を解読機の改良に役立てます。</p>
+
+<h2>音声はブラウザの外に出ません</h2>
+<p>音声の解読は、すべてお使いのブラウザの中で行います。
+音声がサーバーへ送られることはなく、このページが自動で何かを送信することもありません。</p>
+<p>「詳細設定」で、直近30秒の音声をメモリに保持し、WAVファイルとしてお使いの端末に保存できます。
+この設定は既定でオフで、保存した音声もアップロードされません。
+録音を共有していただける場合は、ご自身で選んだ場所にアップロードし、そのリンクを訂正の欄に書き添えてください。</p>
+
+<h2>訂正の報告で送られる内容</h2>
+<p>局ごとの「訂正」ボタンを押すと、入力欄が記入済みのGoogleフォームが開きます。
+内容を確認したうえで、送信するかどうかをご自身で決めてください。
+フォームで送信されるのは次の内容です。</p>
+<ul>
+  <li>実際に聞こえた文字として、あなたが入力した訂正。</li>
+  <li>その局について解読機が表示した文字。</li>
+  <li>アプリと解読機のバージョン、局の周波数、速度(WPM)、SN比、入力の種類(マイクまたはファイル)とサンプリング周波数。</li>
+  <li>解読の記録(チェックを外せば添付されません)。その局の直近60秒について、符号の長短の時間、速度やSN比の推定値、解読した各文字とその候補の確率を圧縮した文字列です。</li>
+</ul>
+<p>解読の記録に音声は含まれません。
+ただし、符号の時間から送信内容を復元できるため、コールサインなど電波で送られた内容が含まれます。</p>
+
+<h2>送信内容の扱い</h2>
+<ul>
+  <li>送信していただいた内容(訂正、解読結果、解読の記録、リンクした録音を含みます)は、クリエイティブ・コモンズ 表示 4.0 国際 ライセンス(<a href="https://creativecommons.org/licenses/by/4.0/deed.ja">CC BY 4.0</a>)の下で利用を許諾していただくものとします。</li>
+  <li>送信内容は、解読機の評価と改良に利用します。これには機械学習モデルの学習と評価への利用を含みます。</li>
+  <li>送信内容は原則として公開しません。
+    将来データセットとして公開する場合は、事前に内容を確認し、連絡先などの個人情報を取り除きます。</li>
+  <li>録音へのリンクを添える場合は、ご自身で録音したものなど、共有する権利をお持ちのものに限ってください。</li>
+  <li>電波法その他の法令に違反する内容の投稿はご遠慮ください。投稿内容の適法性は投稿者が確認し、その責任を負うものとします。</li>
+</ul>
+
+<h2>送信内容の取り下げ</h2>
+<p>送信は匿名で受け付けており、送信後の取り下げはできません。
+個人を特定できる情報は記入しないでください。</p>
+
+<h2>プライバシー</h2>
+<ul>
+  <li>マイクは「開始」を押してから「停止」を押すまでの間だけ使います。
+    加工されていない信号を解読するため、エコーキャンセル、ノイズ抑制、自動音量調整はオフにしています。</li>
+  <li>ブラウザに保存するのは表示の設定(表示テーマ、選んだマイク、候補表示の有無)だけです。</li>
+  <li>このページは外部のスクリプト、フォント、アクセス解析を読み込みません。</li>
+  <li>フォームはGoogleフォームで受け付けており、Googleのプライバシーポリシーが適用されます。
+    氏名や連絡先などの個人情報は記入しないでください。</li>
+  <li>このサイトはGitHub Pagesで公開しています。GitHubがセキュリティのために閲覧者のIPアドレスを記録することがあります。</li>
+</ul>
+
+<h2>ライセンス</h2>
+<p>このサイトと解読機のプログラムはMITライセンス(Copyright (c) 2026 JG1VPP &amp; JS2FVO)で公開しています。
+送信していただいた内容は、上記のとおりCC BY 4.0で扱います。</p>
+
+<section id="en" class="lang" lang="en">
+<h2>About (English)</h2>
+<p>This site decodes Morse code (CW) from your microphone or from a WAV recording, separately for each station it hears.
+All decoding runs in your browser, and no audio is ever uploaded.</p>
+<p>When you report a correction, a pre-filled Google Form opens, and you decide whether to submit it.
+A report contains your correction, the decoded text, the app and decoder versions, the frequency, speed, SNR and sample rate, and, unless you untick it, a compact decoder trace (element durations, speed and SNR estimates and character probabilities over the last 60 seconds; no audio).</p>
+<p>By submitting, you license your submission under <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+Submissions are used to evaluate and improve the decoder, including training models.
+They are not published by default; before any dataset release they are reviewed and any personal details are removed.
+Please do not submit content that violates the Radio Act or other laws; submitters are responsible for the legality of their submissions.
+Submissions are anonymous and cannot be withdrawn after sending, so please do not include personal information.</p>
+<p>The code is released under the MIT licence (Copyright (c) 2026 JG1VPP &amp; JS2FVO).</p>
+</section>
+</main>
+<footer class="bar small"><span>rumo-web 0.2.0</span><a href="index.html">解読機に戻る</a></footer>
+</body>
+</html>
