@@ -51,6 +51,14 @@ fn noiseless_signal_decodes() {
 }
 
 #[test]
+fn period_and_comma_decode() {
+    let (st, x) = single("TEST, DE JA1ZLO.", 22.0, 20.0, 18);
+    let t = texts(&decode(&x, 400, Config::default()));
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert_eq!(t[0].2, st.text);
+}
+
+#[test]
 fn noise_only_has_no_commits() {
     for seed in 1..=3 {
         let x = scene(&[], 30.0, 0.0, seed);

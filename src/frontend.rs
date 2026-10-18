@@ -11,6 +11,8 @@ pub struct Kernel {
     tab: Vec<C64>,
     /// Spectrum of a linear amplitude ramp across the window (keying transient).
     tab2: Vec<C64>,
+    /// Sum of |K|^2 over integer offsets (energy of a line in the bins).
+    pub norm: f64,
 }
 
 impl Kernel {
@@ -109,7 +111,20 @@ impl Frontend {
             pos: 0,
             fft: Fft::new(m),
             work: vec![C64::ZERO; m],
-            kernel: Kernel { r, step, tab, tab2 },
+            kernel: {
+                let mut k = Kernel {
+                    r,
+                    step,
+                    tab,
+                    tab2,
+                    norm: 0.0,
+                };
+                for d in -(r as i64)..=(r as i64) {
+                    let v = k.at(d as f64);
+                    k.norm += v.re * v.re + v.im * v.im;
+                }
+                k
+            },
         }
     }
 

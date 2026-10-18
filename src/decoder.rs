@@ -13,6 +13,7 @@ use crate::frontend::Frontend;
 use crate::hsmm::SoftKeyer;
 use crate::keyer::Keyer;
 use crate::model::{CharMeta, Hyp, GAMMA};
+use crate::nn::{self, NnState, INPUTS};
 use crate::special::remainder;
 use crate::timing::Timing;
 use crate::{Config, Element};
@@ -92,11 +93,28 @@ const GHOST_HZ: f64 = 400.0;
 const GHOST_FRAMES: i64 = 4;
 /// Fraction of coinciding onsets that marks a ghost.
 const GHOST_FRAC: f64 = 0.6;
-/// Range (Hz) and relative level of neighbours that make a track not isolated.
-const ISOLATION_HZ: f64 = 300.0;
-const ISOLATION_LEVEL: f64 = 0.25;
 /// Range (Hz) of louder neighbours that suspend frequency refinement.
 const DOMINANCE_HZ: f64 = 80.0;
+/// Scale of the network's log-odds in the soft keyer and its bound.
+const NN_TAU: f64 = 0.75;
+const NN_CLIP: f64 = 8.0;
+/// Frames over which a new track's likelihood moves from the Rician model to the network.
+const NN_BLEND: u32 = 200;
+/// Release of the log-power peak follower per frame (about 43 dB/s).
+const NN_PEAK_RELEASE: f64 = 0.05;
+/// The noise reference stays within this log-power distance below the peak (40 dB).
+const NN_RANGE: f64 = 9.2;
+/// Up and down steps of the noise quantile tracker (about the 20th percentile).
+const NN_UP: f64 = 0.005;
+const NN_DOWN: f64 = 0.02;
+/// Bounds of the log-power features.
+const NN_LA: (f64, f64) = (-10.0, 15.0);
+const NN_LB: (f64, f64) = (-10.0, 20.0);
+const NN_LP: (f64, f64) = (-15.0, 0.0);
+/// Range (Hz) of the neighbour features.
+const NN_NEIGHBOUR_HZ: f64 = 300.0;
+/// Smallest power in a logarithm.
+const POWER_MIN: f64 = 1e-30;
 /// Regularisation of the joint fit relative to the mean diagonal of the Gram matrix.
 const FIT_REG: f64 = 1e-3;
 
@@ -129,6 +147,17 @@ pub struct Track {
     edges: VecDeque<Edge>,
     peak_e: f64,
     pub sk: Option<SoftKeyer>,
+    nst: NnState,
+}
+
+/// Snapshot of one track in one frame (neighbour features of the key-state network).
+#[derive(Clone, Copy)]
+struct NbRec {
+    id: u32,
+    nu: f64,
+    la: f64,
+    pc: f64,
+    level: f64,
 }
 
 /// Parameters shared by the per-track functions.
@@ -136,6 +165,10 @@ struct Ctx<'a> {
     cfg: &'a Config,
     rate: f64,
     m: f64,
+    /// Per-bin noise floor, its first bin and the energy of a line in the bins.
+    floor: &'a [f64],
+    lo: usize,
+    knorm: f64,
 }
 
 impl Ctx<'_> {
@@ -147,6 +180,12 @@ impl Ctx<'_> {
     #[inline]
     fn hz_bin(&self, f: f64) -> f64 {
         f * self.m / self.rate
+    }
+
+    /// Noise floor at the bin nearest to frequency nu (bins).
+    fn noise_at(&self, nu: f64) -> f64 {
+        let k = (nu.round() as i64 - self.lo as i64).clamp(0, self.floor.len() as i64 - 1);
+        self.floor[k as usize]
     }
 }
 
@@ -160,7 +199,7 @@ pub struct Core {
     nfloor: i64,
     smooth: Vec<f64>,
     cand: HashMap<i64, i64>,
-    ring: VecDeque<Vec<C64>>,
+    ring: VecDeque<(Vec<C64>, Vec<NbRec>)>,
     pub frame_no: i64,
     pub out: Vec<Out>,
     gmax: f64,
@@ -224,11 +263,15 @@ impl Core {
             cfg: &self.cfg,
             rate: self.fe.rate as f64,
             m: self.fe.m as f64,
+            floor: &self.floor,
+            lo: self.fe.lo,
+            knorm: self.fe.kernel.norm,
         };
         for t in &mut self.tracks {
             t.tim.tick(t.key.gap() + FLUSH_GAP, true, true);
             t.tim.release();
-            deliver(&mut self.out, t, &ctx);
+            let f = ctx.hz(t.nu);
+            deliver(&mut self.out, t, f);
         }
     }
 
@@ -320,11 +363,15 @@ impl Core {
         }
         self.nfloor += 1;
         let dt = self.frame_seconds();
+        let nb = self.snapshot(dt);
         for i in 0..self.tracks.len() {
             let ctx = Ctx {
                 cfg: &self.cfg,
                 rate: self.fe.rate as f64,
                 m: self.fe.m as f64,
+                floor: &self.floor,
+                lo: self.fe.lo,
+                knorm: self.fe.kernel.norm,
             };
             let (a, rest) = self.tracks.split_at_mut(i);
             let (t, b) = rest.split_first_mut().unwrap();
@@ -337,11 +384,12 @@ impl Core {
                 dt,
                 self.frame_no,
                 true,
+                &nb,
                 &mut self.out,
                 &mut self.elements,
             );
         }
-        self.ring.push_back(resid.clone());
+        self.ring.push_back((resid.clone(), nb));
         if self.ring.len() > self.cfg.lookback {
             self.ring.pop_front();
         }
@@ -484,6 +532,7 @@ impl Core {
             edges: VecDeque::new(),
             peak_e: 0.0,
             sk: None,
+            nst: NnState::default(),
         };
         self.next_id += 1;
         let k = &self.fe.kernel;
@@ -497,7 +546,7 @@ impl Core {
         }
         let mut cs = Vec::with_capacity(self.ring.len());
         let mut es = Vec::with_capacity(self.ring.len());
-        for f in &self.ring {
+        for (f, _) in &self.ring {
             let mut s = C64::ZERO;
             for kk in b0..=b1 {
                 s += cols[kk - b0].conj() * f[kk];
@@ -522,10 +571,14 @@ impl Core {
             cfg: &self.cfg,
             rate: self.fe.rate as f64,
             m: self.fe.m as f64,
+            floor: &self.floor,
+            lo: self.fe.lo,
+            knorm: self.fe.kernel.norm,
         };
         for (i, &c) in cs.iter().enumerate() {
             t.prev_c = t.c;
             t.c = c;
+            let nb = &self.ring[i].1;
             advance(
                 &ctx,
                 &mut t,
@@ -534,6 +587,7 @@ impl Core {
                 dt,
                 first + i as i64,
                 false,
+                nb,
                 &mut self.out,
                 &mut self.elements,
             );
@@ -554,15 +608,8 @@ impl Core {
                 if t.confirmed {
                     t.tim.tick(t.key.gap(), true, true);
                     t.tim.release();
-                    deliver(
-                        &mut self.out,
-                        &mut t,
-                        &Ctx {
-                            cfg: &self.cfg,
-                            rate,
-                            m,
-                        },
-                    );
+                    let f = t.nu * rate / m;
+                    deliver(&mut self.out, &mut t, f);
                 }
                 continue;
             }
@@ -623,14 +670,14 @@ fn solve(a: &mut [C64], b: &mut [C64], n: usize) -> Vec<C64> {
     x
 }
 
-fn deliver(out: &mut Vec<Out>, t: &mut Track, ctx: &Ctx) {
+fn deliver(out: &mut Vec<Out>, t: &mut Track, freq: f64) {
     if t.tim.out().is_empty() {
         return;
     }
     let (text, meta) = t.tim.take_out();
     out.push(Out {
         track: t.id,
-        freq: ctx.hz(t.nu),
+        freq,
         text,
         meta,
     });
@@ -653,11 +700,13 @@ fn advance(
     dt: f64,
     fr: i64,
     live: bool,
+    nb: &[NbRec],
     out: &mut Vec<Out>,
     elements: &mut Option<Vec<(u32, i64, Element)>>,
 ) {
     let cfg = ctx.cfg;
     let e = c.re * c.re + c.im * c.im;
+    let feats = features(ctx, t, c, e, dt, nb);
     // phase-advance frequency refinement on strong frames
     if live
         && t.key.on
@@ -676,7 +725,6 @@ fn advance(
     if t.tim.ambig() <= AMBIG_LOW {
         unit = 0.0;
     }
-    t.key.unbiased = (t.confirmed || t.tim.nchars() >= 1) && isolated(ctx, t, others);
     let was = t.key.on;
     t.key.step(e, unit, |_| {});
     let sk =
@@ -684,9 +732,19 @@ fn advance(
     let best: Hyp = t.tim.best();
     sk.build(best, t.tim.ambig() <= AMBIG_LOW);
     let s = (t.key.peak / t.key.noise - 1.0).max(SOFT_SNR_MIN);
+    let x = e / t.key.noise;
+    // key-down log-likelihood ratio from the network, blended from the Rician model
+    // over the first frames of a track (the network has no history of a new station)
+    let lg = nn::step(&mut t.nst, &feats);
+    t.nst.age += 1;
+    let mut llr = (NN_TAU * (lg - nn::prior_logit())).clamp(-NN_CLIP, NN_CLIP);
+    if t.nst.age < NN_BLEND {
+        let w = t.nst.age as f64 / NN_BLEND as f64;
+        llr = w * llr + (1.0 - w) * sk.rician_llr(x, s);
+    }
     let tim = &mut t.tim;
     let id = t.id;
-    sk.step(e / t.key.noise, s, |el| {
+    sk.step(llr, |el| {
         if let Some(log) = elements.as_mut() {
             log.push((id, fr, el));
         }
@@ -729,7 +787,8 @@ fn advance(
     t.tim.tick(gap_now, t.confirmed, false);
     t.tim.open_gap(gap_now, t.confirmed);
     if live {
-        deliver(out, t, ctx);
+        let f = ctx.hz(t.nu);
+        deliver(out, t, f);
     }
 }
 
@@ -759,14 +818,92 @@ fn ghost_of(ctx: &Ctx, t: &Track, others: Others) -> bool {
     false
 }
 
-/// Whether no other track within 300 Hz is at least a quarter as strong.
-fn isolated(ctx: &Ctx, t: &Track, others: Others) -> bool {
-    !others_iter(others)
-        .any(|o| ctx.hz(o.nu - t.nu).abs() < ISOLATION_HZ && o.level > ISOLATION_LEVEL * t.level)
-}
-
 /// Whether a stronger track within 80 Hz is louder in this frame.
 fn dominated(ctx: &Ctx, t: &Track, others: Others, e: f64) -> bool {
     others_iter(others)
         .any(|o| ctx.hz(o.nu - t.nu).abs() <= DOMINANCE_HZ && o.c.re * o.c.re + o.c.im * o.c.im > e)
+}
+
+/// Cosine of the deviation of a frame's phase advance from the advance expected at the
+/// track frequency (1 for a steady carrier, 0 when undefined).
+fn phase_cons(c: C64, prev: C64, hz: f64, dt: f64) -> f64 {
+    if prev.is_zero() || c.is_zero() {
+        return 0.0;
+    }
+    let want = 2.0 * std::f64::consts::PI * hz * dt;
+    remainder((c * prev.conj()).arg() - want, 2.0 * std::f64::consts::PI).cos()
+}
+
+#[inline]
+fn clamp(x: f64, b: (f64, f64)) -> f64 {
+    x.min(b.1).max(b.0)
+}
+
+impl Core {
+    /// Records all tracks of the current frame (after the fit) for neighbour features.
+    fn snapshot(&self, dt: f64) -> Vec<NbRec> {
+        self.tracks
+            .iter()
+            .map(|t| {
+                let mut la = t.nst.la;
+                if t.nst.init {
+                    let e = t.c.re * t.c.re + t.c.im * t.c.im;
+                    la = clamp(e.max(POWER_MIN).ln() - t.nst.nf, NN_LA);
+                }
+                NbRec {
+                    id: t.id,
+                    nu: t.nu,
+                    la,
+                    pc: phase_cons(t.c, t.prev_c, self.hz(t.nu), dt),
+                    level: t.level,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Input features of the key-state network for track t in one frame.
+fn features(ctx: &Ctx, t: &mut Track, c: C64, e: f64, dt: f64, nb: &[NbRec]) -> [f32; INPUTS] {
+    let st = &mut t.nst;
+    let l = e.max(POWER_MIN).ln();
+    if !st.init {
+        // start from the birth estimate of the noise, which does not depend on the keyer
+        st.nf = t.key.noise.max(POWER_MIN).ln();
+        st.init = true;
+        st.pk = l;
+    }
+    st.pk = l.max(st.pk - NN_PEAK_RELEASE);
+    st.nf = st.nf.max(st.pk - NN_RANGE);
+    let la = clamp(l - st.nf, NN_LA);
+    if l > st.nf {
+        st.nf += NN_UP;
+    } else {
+        st.nf -= NN_DOWN;
+    }
+    st.la = la;
+    let floor = (ctx.noise_at(t.nu).max(POWER_MIN) / ctx.knorm).ln();
+    let lb = clamp(l - floor.max(st.pk - NN_RANGE), NN_LB);
+    let mut f = [0f32; INPUTS];
+    f[0] = la as f32;
+    f[1] = lb as f32;
+    f[2] = phase_cons(c, t.prev_c, ctx.hz(t.nu), dt) as f32;
+    f[3] = clamp(l - st.pk, NN_LP) as f32;
+    f[4] = 0.0;
+    f[5] = 1.0;
+    f[6] = 0.0;
+    let mut best = -1.0;
+    for o in nb {
+        if o.id == t.id {
+            continue;
+        }
+        let df = ctx.hz(o.nu - t.nu).abs();
+        if df > NN_NEIGHBOUR_HZ || o.level <= best {
+            continue;
+        }
+        best = o.level;
+        f[4] = o.la as f32;
+        f[5] = (df / NN_NEIGHBOUR_HZ) as f32;
+        f[6] = o.pc as f32;
+    }
+    f
 }

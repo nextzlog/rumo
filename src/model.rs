@@ -77,7 +77,7 @@ pub const WG_MIN_REL: f64 = 1.25;
 pub const RARE_LP: f64 = 0.2;
 
 /// The Morse table: character and code.
-pub const MORSE: [(char, &str); 39] = [
+pub const MORSE: [(char, &str); 41] = [
     ('A', ".-"),
     ('B', "-..."),
     ('C', "-.-."),
@@ -117,6 +117,8 @@ pub const MORSE: [(char, &str); 39] = [
     ('/', "-..-."),
     ('?', "..--.."),
     ('=', "-...-"),
+    ('.', ".-.-.-"),
+    (',', "--..--"),
 ];
 
 pub struct Tables {
@@ -192,7 +194,7 @@ pub fn char_of(code: &str) -> Option<char> {
 
 /// Relative prior of a character (rarer punctuation is penalised).
 pub fn char_lp(c: char) -> f64 {
-    if c == '?' || c == '=' || c == '/' {
+    if matches!(c, '?' | '=' | '/' | '.' | ',') {
         RARE_LP
     } else {
         1.0
@@ -389,6 +391,9 @@ mod tests {
         assert!(informative('K') && informative('R') && !informative('S') && !informative('5'));
         assert!(!informative('A') && informative('J'));
         assert_eq!(char_lp('/'), 0.2);
+        assert_eq!((char_lp('.'), char_lp(','), char_lp('A')), (0.2, 0.2, 1.0));
+        assert_eq!(char_of(".-.-.-"), Some('.'));
+        assert!(informative(','));
     }
 
     #[test]
