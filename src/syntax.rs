@@ -343,6 +343,11 @@ fn run_together(w: &str, valid_call: bool) -> bool {
         .any(|i| w.is_char_boundary(i) && is_callsign(&w[..i]) && is_callsign(&w[i..]))
 }
 
+/// Whether one more letter after the callsign would still give a valid callsign.
+fn extendable(w: &str) -> bool {
+    !w.contains('/') && ('A'..='Z').any(|c| base_call(&format!("{w}{c}")))
+}
+
 fn kind_is_seen(seen: &[String], text: &str) -> bool {
     seen.iter().any(|s| s == text)
 }
@@ -363,6 +368,9 @@ pub struct Reader {
     seen: Vec<String>,
     /// The track's first character was dropped, so its first token may be incomplete.
     truncated: bool,
+    /// A confirmed callsign that one more letter would keep valid, held until the next
+    /// token shows whether that token completes it.
+    held: Option<Token>,
 }
 
 impl Reader {
@@ -402,7 +410,23 @@ impl Reader {
     pub fn finish(&mut self) -> Vec<Token> {
         let mut out = Vec::new();
         self.close(&mut out);
+        out.extend(self.held.take());
         out
+    }
+
+    /// Releases the held callsign before the token `next`: when the two joined form a
+    /// longer valid callsign (DEJA0BZ E), the space between them may be a lost character
+    /// gap, so the callsign is shown as run together.
+    fn release(&mut self, next: &str, out: &mut Vec<Token>) {
+        if let Some(mut h) = self.held.take() {
+            if !next.is_empty() && is_callsign(&format!("{}{}", h.text, next)) {
+                h.verdict = Verdict::RunTogether;
+                if !h.repeat {
+                    self.seen.retain(|s| *s != h.text);
+                }
+            }
+            out.push(h);
+        }
     }
 
     fn close(&mut self, out: &mut Vec<Token>) {
@@ -412,6 +436,7 @@ impl Reader {
         let open = std::mem::take(&mut self.open);
         let truncated = std::mem::take(&mut self.truncated) && self.open_start == 0;
         let word: String = open.iter().map(|x| x.0.to_ascii_uppercase()).collect();
+        self.release(if word.is_ascii() { &word } else { "" }, out);
         if !word.is_ascii() {
             out.push(Token {
                 start: self.open_start,
@@ -424,7 +449,9 @@ impl Reader {
             });
             return;
         }
-        for (o, l) in split(&word) {
+        let parts = split(&word);
+        let last = parts.len() - 1;
+        for (i, (o, l)) in parts.into_iter().enumerate() {
             let text = &word[o..o + l];
             let doubt = open[o..o + l].iter().any(|x| x.1);
             let lps = open[o..o + l].iter().map(|x| x.2.max(1e-6).ln());
@@ -469,7 +496,7 @@ impl Reader {
                     self.seen.push(text.to_string());
                 }
             }
-            out.push(Token {
+            let tok = Token {
                 start: self.open_start + o,
                 text: text.to_string(),
                 kind,
@@ -477,7 +504,12 @@ impl Reader {
                 min_lp,
                 sum_lp,
                 repeat,
-            });
+            };
+            if i == last && kind == TokenKind::Callsign && verdict.confirmed() && extendable(text) {
+                self.held = Some(tok);
+            } else {
+                out.push(tok);
+            }
         }
     }
 }
@@ -605,6 +637,27 @@ mod tests {
     fn part_of_an_earlier_call() {
         let t = read("JA9MAT JA9MA T", &[]);
         assert_eq!((t[0].2, t[1].2), (Verdict::Confirmed, Verdict::Partial));
+    }
+
+    #[test]
+    fn a_letter_after_a_space_that_completes_a_call() {
+        // DEJA0BZ E: the space before E may be a lost character gap (JA0BZE)
+        let t = read("DEJA0BZ E", &[]);
+        assert_eq!(
+            t[1],
+            ("JA0BZ".into(), TokenKind::Callsign, Verdict::RunTogether)
+        );
+        assert_eq!(t[2].0, "E");
+        // a following word that does not complete the call leaves it confirmed
+        let t = read("DL1AB 5NN", &[]);
+        assert_eq!(t[0].2, Verdict::Confirmed);
+        // the verdict waits for the next token; the end of the track releases it
+        let mut r = Reader::default();
+        assert!(r.feed("DL1AB ".chars().map(|c| (c, false))).is_empty());
+        assert_eq!(r.finish()[0].verdict, Verdict::Confirmed);
+        // a call that no letter can extend is not held
+        let mut r = Reader::default();
+        assert_eq!(r.feed("JA1ZLO ".chars().map(|c| (c, false))).len(), 1);
     }
 
     #[test]

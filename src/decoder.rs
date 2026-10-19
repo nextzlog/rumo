@@ -114,7 +114,7 @@ const GHOST_FRAC: f64 = 0.6;
 /// Range (Hz) of louder neighbours that suspend frequency refinement.
 const DOMINANCE_HZ: f64 = 80.0;
 /// Scale of the network's log-odds in the soft keyer and its bound.
-const NN_TAU: f64 = 0.75;
+const NN_TAU: f64 = 1.0;
 const NN_CLIP: f64 = 8.0;
 /// Frames over which a new track's likelihood moves from the Rician model to the network.
 const NN_BLEND: u32 = 200;
@@ -773,6 +773,10 @@ impl Core {
         for cv in &cols {
             norm += cv.re * cv.re + cv.im * cv.im;
         }
+        if norm <= 0.0 {
+            // no analysis bin within the kernel's reach (a candidate beyond the band edge)
+            return;
+        }
         let mut cs = Vec::with_capacity(self.ring.len());
         let mut es = Vec::with_capacity(self.ring.len());
         for (f, _) in &self.ring {
@@ -1030,6 +1034,11 @@ fn advance(
     let leak = edge_leak_in(ctx, t, nb);
     let eh = held_power(t, e, leak);
     let feats = features(ctx, t, c, eh, dt, nb);
+    NN_LOG.with(|l| {
+        if let Some(v) = l.borrow_mut().as_mut() {
+            v.push((t.id, fr, ctx.hz(t.nu), live, feats));
+        }
+    });
     // phase-advance frequency refinement on strong frames
     if live
         && t.key.on
@@ -1347,6 +1356,14 @@ impl Core {
 }
 
 /// Input features of the key-state network for track t in one frame.
+/// Network inputs of every track and frame: (track, frame, frequency, live, inputs).
+pub type NnRecord = (u32, i64, f64, bool, [f32; INPUTS]);
+
+thread_local! {
+    /// Recorded network inputs (for training), off unless enabled.
+    pub static NN_LOG: std::cell::RefCell<Option<Vec<NnRecord>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn features(ctx: &Ctx, t: &mut Track, c: C64, e: f64, dt: f64, nb: &[NbRec]) -> [f32; INPUTS] {
     let st = &mut t.nst;
     let l = e.max(POWER_MIN).ln();

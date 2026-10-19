@@ -79,6 +79,7 @@ flowchart TD
 ```
 
 The key-state network turns seven features per track and frame into a key-down likelihood.
+It is trained offline on synthetic signals with known key state, and its training inputs come from the decoder's own feature code.
 Its neighbour inputs describe only a neighbour beyond the 150 Hz reach of keying-edge leakage, because a closer one made it follow the neighbour's keying; closer neighbours are handled by the joint fit, the edge leakage model and the common-fate checks.
 
 ```mermaid
@@ -90,7 +91,7 @@ flowchart LR
   E[Strongest neighbour 150 to 300 Hz away: power, offset, phase consistency] --> F
   F --> G[GRU, 24 units]
   G --> H[Linear output over temperature]
-  H --> I[Logit minus prior logit, times 0.75, clipped to 8]
+  H --> I[Logit minus prior logit, clipped to 8]
   I --> J[Key-down log-likelihood ratio]
 ```
 
@@ -203,12 +204,17 @@ flowchart TD
   G -->|no| H{Callsign run together with a procedure word or a second callsign}
   H -->|yes| R[Doubtful: run together]
   H -->|no| I{Any doubtful character}
-  I -->|no| K[Confirmed]
+  I -->|no| N{Callsign that one more letter keeps valid}
+  N -->|no| K[Confirmed]
+  N -->|yes| O{Joined to the next token, a longer valid callsign}
+  O -->|yes| R
+  O -->|no| K
   I -->|yes| J{Same callsign read before on the track}
   J -->|yes| L[Confirmed: repeated]
   J -->|no| M[Doubtful: doubtful character]
 ```
 
+A confirmed callsign that one more letter keeps valid waits for the next token or the end of the track, because a lost character gap can split a callsign (JA0BZ E for JA0BZE).
 A callsign has a prefix of one letter of the B F G I K M N R W series or two characters, one area digit and a suffix of one to four letters.
 Japanese prefixes JA to JS take a suffix of two or three letters, 7K to 7N take area 1 to 4 and three letters, and JD takes area 1.
 A prefix before a slash and a portable digit, P, M, MM, AM, A, QRP or country prefix after it are accepted.
