@@ -588,6 +588,24 @@ impl Decoder {
             .collect()
     }
 
+    /// Starts recording the key-state network inputs of all tracks (for training; per
+    /// thread).
+    #[doc(hidden)]
+    pub fn record_network_inputs(&mut self, on: bool) {
+        decoder::NN_LOG.with(|l| *l.borrow_mut() = if on { Some(Vec::new()) } else { None });
+    }
+
+    /// Takes the recorded network inputs: (track, frame, frequency, live, inputs).
+    #[doc(hidden)]
+    pub fn take_network_inputs(&mut self) -> Vec<(u32, i64, f64, bool, [f32; 7])> {
+        decoder::NN_LOG.with(|l| {
+            l.borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+        })
+    }
+
     /// Starts recording the keyer output of all tracks (for diagnostics and feedback traces).
     pub fn record_elements(&mut self, on: bool) {
         self.core.elements = if on { Some(Vec::new()) } else { None };
